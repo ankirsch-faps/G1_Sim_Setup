@@ -54,6 +54,13 @@ Objekt (z.B. eine Box) dorthin setzen und es **`g1_spawn`** nennen (Ordner
 Blickrichtung. Die Markierung wird beim Kombinieren entfernt (kein Hindernis);
 auch START / START BALANCING stellen den Roboter wieder dort auf.
 
+**Stationen fuer AUTO NAV:** Objekte (z.B. flache Boxen) **`station_<Name>`**
+nennen, z.B. `station_Rampe`. Position = Ziel, Drehung um die Hochachse =
+Blickrichtung am Ziel. Wie `g1_spawn` werden sie beim Kombinieren entfernt
+(kein Hindernis); in RViz erscheinen sie als gruener Pfeil mit Namen, und die
+Demo-GUI zeigt im Gehen-Bereich je Station einen Knopf („➜ Rampe"): Klick setzt
+das Ziel und schaltet AUTO NAV ein.
+
 ```
 box_demo        -> Hindernis (statisch, der Arm weicht aus)
 grasp_apfel      -> Greif-Objekt (beweglich, die Hand darf ran)
@@ -362,3 +369,12 @@ Mehr dazu in `meshes/README.md`.
   erneut ausfuehren (braucht genug freien Diskspeicher!) und danach die
   betroffene(n) Szene(n) neu bauen (`python3 build_env_scene.py --env
   scenes/<name>.xml`, oder einfach `g1pilot/start.sh` neu starten).
+- **Objekte rutschen ueber lange Zeit vom Tisch / liegen sichtbar ueber der
+  Platte** – die V-HACD-Huellen sind voxelbasiert (bei einem 5 m breiten
+  Arbeitsplatz ~4 cm pro Voxel) und stehen ueber der echten Tischplatte, mit
+  leicht schraegen Oberseiten. `build_env_scene.py` erkennt darum grosse,
+  ebene, waagrechte Rechtecke im Mesh (Tischplatten, Regalboeden), schneidet
+  die Huellen dort knapp ueber der Platte aus und legt die Platte als exakte
+  Box an (im Viewer Gruppe 3: gruen = Ablageflaeche, rot = Huellen). Zusaetzlich
+  das Moebel selbst gerade stellen: in der Szene nur um z drehen, keine
+  Neigung um x/y -- schon 1-2 Grad reichen, damit Boxen langsam wandern.

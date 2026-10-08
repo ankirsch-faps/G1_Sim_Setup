@@ -26,7 +26,12 @@ Zwei Betriebsarten:
 - Ein laufendes X11-Display (für RViz und die MuJoCo-/Teleop-Fenster).
   Unter Wayland hilft in der Regel `xhost` über den XWayland-Layer; über SSH
   mit `ssh -X` verbinden.
-- Keine GPU/CUDA nötig — die Simulation ist rein CPU-basiert.
+- Keine GPU/CUDA nötig — die Physik läuft auf der CPU. Für flüssige FPS
+  sollten MuJoCo-Viewer und RViz aber auf der GPU rendern (sonst CPU-Rendering
+  per `llvmpipe`, das der Physik die Kerne wegnimmt). Intel/AMD-Grafik geht
+  über `/dev/dri` automatisch. **Bei einer NVIDIA-Karte ist zusätzlich das
+  NVIDIA Container Toolkit nötig** — `start.sh` / `make sim` warnen, wenn es
+  fehlt; Prüfung jederzeit mit `make gpu-check`.
 
 ## Schritt für Schritt (Linux)
 
@@ -270,9 +275,24 @@ Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -D
 ## Starten im Alltag
 
 Der einfachste Einstieg ist `./start.sh`. Ohne Argumente öffnet sich ein
-grafisches Startmenü (`g1_gui.py`, Tkinter): drei Karten — *Simulation
-starten*, *Echten Roboter starten*, *Umgebungen bearbeiten*. Alles läuft in
-einem Fenster; Menü, Optionsseiten und Log-Ansicht werden ausgetauscht.
+grafisches Startmenü (`g1_gui.py`, Tkinter): drei Karten — *Simulation*,
+*Echter Roboter*, *Umgebungen*. Alles läuft in einem Fenster; Menü,
+Optionsseiten und Log-Ansicht werden ausgetauscht.
+
+Die Optionsseiten von Simulation und echtem Roboter sind gleich aufgebaut:
+
+| Abschnitt | Simulation | Echter Roboter |
+|---|---|---|
+| Umgebung / Verbindung | Szene aus `scene_editor/scenes/` | Netzwerk-Interface (prüft auf 192.168.123.x) |
+| Bedienoberfläche | Demo-GUI (Default) oder Streamdeck | Demo-GUI (Default) oder Streamdeck |
+| Ausstattung | Inspire-Hände (Default an), Navigation, RViz (bei Navigation Pflicht) | Inspire-Hände + IPs, RViz |
+| Geh-Limits | — | vorwärts / seitlich / drehen |
+| Erweitert (eingeklappt) | Sim-Tempo, Images neu bauen | Modbus-Port, Gamepad-Name, LiDAR (experimentell), Images neu bauen |
+
+Die Hand-Oberflächen im Browser werden nur beim Streamdeck angeboten; die
+Demo-GUI hat die Handsteuerung eingebaut. Die letzte Auswahl merkt sich das
+Startmenü in `~/.config/g1pilot/launcher.json` (nicht die
+Sicherheitsbestätigung und nicht „Images neu bauen“).
 Startet man einen Stack, erscheint dessen Docker-Ausgabe live im Fenster mit
 einem Stop-Button. Über *‹ Menü* geht man zurück, ohne den Stack zu beenden —
 er taucht unter *Laufende Prozesse* wieder auf. Fehlt Tkinter oder ein
@@ -338,5 +358,6 @@ erreichbar, sowie aus dem grafischen Startmenü über den Menüpunkt
 | `setup.sh`: `No matching distribution found for mujoco-scene-editor` / `Requires-Python <3.13` | Host-Python zu neu (Ubuntu 26.04: 3.14) → Python 3.12 per uv, siehe Schritt 5b. |
 | `setup.sh`: `No module named 'ensurepip'` | `sudo apt install python3-venv`, dann `rm -rf .venv && ./setup.sh`. |
 | Greif-Objekte fliegen weg, ständig `[scene-reset]` | `trimesh`/`vhacdx` fehlen im `scene_editor/.venv` → Schritt 5b. |
+| Sim läuft mit sehr wenigen FPS, Log zeigt `[gpu] WARNUNG: MuJoCo rendert auf der CPU (llvmpipe)` | Container hat keinen GPU-Zugriff. Häufigster Grund: NVIDIA-Karte ohne NVIDIA Container Toolkit. `make gpu-check` zeigt Ursache und Installationsbefehle; danach `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` und Sim neu starten. |
 | `make sim` baut jedes Mal neu | Normal, sofern sich Quellcode/Dockerfile geändert haben; Docker cached unveränderte Layer. |
 | Fenster öffnen sich, aber der Roboter reagiert auf nichts | Zunächst normal — siehe [30_loco_anleitung.md](30_loco_anleitung.md), der Roboter startet bewusst nicht automatisch. |

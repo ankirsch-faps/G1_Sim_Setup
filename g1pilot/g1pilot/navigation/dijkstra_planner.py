@@ -49,7 +49,13 @@ class DijkstraPlanner(Node):
         self.declare_parameter('occ_threshold',50)
         self.declare_parameter('allow_diagonal',True)
         self.declare_parameter('straight_steps',50)
-        self.declare_parameter('inflation_radius_m',0.40)
+        # Sicherheitsabstand zu Objekten (Roboter-Halbbreite + Reserve).
+        self.declare_parameter('inflation_radius_m',0.30)
+        # Zielanfahrt: die letzten goal_approach_m vor dem Ziel duerfen in den
+        # Sicherheitsabstand hinein (sonst ist z.B. eine Station 0.25 m vor dem
+        # Tisch unerreichbar) -- aber nie naeher als goal_min_clearance_m ans Objekt.
+        self.declare_parameter('goal_approach_m',0.60)
+        self.declare_parameter('goal_min_clearance_m',0.10)
         self.declare_parameter('smooth_enable',True)
         self.declare_parameter('smooth_samples_per_segment',8)
         self.declare_parameter('smooth_closed',False)
@@ -68,6 +74,7 @@ class DijkstraPlanner(Node):
         self.occ=[]; self.occ_inf=[]
         self.inf_radius_cells=0
         self.have_pose=False
+        self.goal_cell=None
         self.px=self.py=self.pyaw=0.0
 
     def cb_map(self,msg):
@@ -79,8 +86,11 @@ class DijkstraPlanner(Node):
         self.w=int(msg.info.width)
         self.h=int(msg.info.height)
         self.occ=list(msg.data)
-        self.inf_radius_cells=int(math.ceil(0.40/self.res)) if self.res>0.0 else 0
+        cells=lambda m_: int(math.ceil(float(m_)/self.res)) if self.res>0.0 else 0
+        self.inf_radius_cells=cells(self.get_parameter('inflation_radius_m').value)
         self.occ_inf=self.inflate_occupancy(self.occ,self.w,self.h,self.inf_radius_cells,50)
+        self.occ_hard=self.inflate_occupancy(self.occ,self.w,self.h,cells(self.get_parameter('goal_min_clearance_m').value),50)
+        self.approach_cells=cells(self.get_parameter('goal_approach_m').value)
 
     def cb_odom(self,msg):
         self.px=float(msg.pose.pose.position.x)
@@ -94,21 +104,46 @@ class DijkstraPlanner(Node):
     def cb_goal(self,msg):
         if not self.have_pose:
             self.get_logger().warn("No odom pose yet.")
-            return
+            self.publish_no_path(); return
         gx=float(msg.pose.position.x); gy=float(msg.pose.position.y)
         if self.map is None:
             self.publish_path(self.line_points(self.px,self.py,gx,gy,msg.header.frame_id or 'map'),msg.header.frame_id or 'map')
             return
         sx,sy=self.world_to_grid(self.px,self.py)
         gx_i,gy_i=self.world_to_grid(gx,gy)
+        self.goal_cell=(gx_i,gy_i)   # Zielanfahrt-Zone um das Ziel (siehe is_occ)
         if not self.in_bounds(sx,sy) or not self.in_bounds(gx_i,gy_i):
             self.publish_path(self.line_points(self.px,self.py,gx,gy,self.map_frame),self.map_frame); return
-        if self.is_occ(sx,sy) or self.is_occ(gx_i,gy_i):
-            self.publish_path(self.line_points(self.px,self.py,gx,gy,self.map_frame),self.map_frame); return
+        # Start/Ziel im Sicherheitsabstand (inflation_radius_m) eines Objekts --
+        # z.B. Roboter steht direkt vor dem Tisch, oder Ziel neben einer KLT
+        # angeklickt: auf die naechste freie Zelle schieben, statt (wie frueher)
+        # eine gerade Linie DURCH die Objekte zu publizieren.
+        start_snapped=False
+        goal_snapped=False
+        if self.is_occ(sx,sy):
+            free=self.nearest_free(sx,sy)
+            if free is None:
+                self.get_logger().warn("Start blockiert, keine freie Zelle in Reichweite -> kein Pfad.")
+                self.publish_no_path(); return
+            sx,sy=free; start_snapped=True
+            self.get_logger().info("Start im Sicherheitsabstand eines Objekts -> von naechster freier Zelle aus geplant.")
+        if self.is_occ(gx_i,gy_i):
+            free=self.nearest_free(gx_i,gy_i)
+            if free is None:
+                self.get_logger().warn("Ziel blockiert, keine freie Zelle in Reichweite -> kein Pfad.")
+                self.publish_no_path(); return
+            gx_i,gy_i=free
+            goal_snapped=True
+            self.get_logger().info("Ziel im Sicherheitsabstand eines Objekts -> auf naechste freie Stelle verschoben.")
         path_idx=self.dijkstra((sx,sy,self.pyaw),(gx_i,gy_i))
         if not path_idx:
-            self.publish_path(self.line_points(self.px,self.py,gx,gy,self.map_frame),self.map_frame); return
+            self.get_logger().warn("Kein kollisionsfreier Pfad gefunden -> leerer Pfad (Stopp).")
+            self.publish_no_path(); return
         pts=[self.grid_to_world(ix,iy) for ix,iy in path_idx]
+        if start_snapped:
+            pts.insert(0,(self.px,self.py))   # vom echten Standort aus der Zone heraus
+        if not goal_snapped:
+            pts[-1]=(gx,gy)   # exakt aufs Ziel (Station), nicht auf die Zellmitte
         pts=self.simplify_spacing(pts,0.02)
         pts=self.shortcut_path(pts)
         pts=_catmull_rom_centripetal(pts,8,False)
@@ -120,8 +155,15 @@ class DijkstraPlanner(Node):
         return self.ox+(ix+0.5)*self.res, self.oy+(iy+0.5)*self.res
     def in_bounds(self,ix,iy): return 0<=ix<self.w and 0<=iy<self.h
     def is_occ(self,ix,iy):
-        v=self.occ_inf[iy*self.w+ix]
-        return v>=50 and v!=255
+        i=iy*self.w+ix
+        v=self.occ_inf[i]
+        if v<50 or v==255:
+            return False
+        g=getattr(self,'goal_cell',None)
+        if g is not None and math.hypot(ix-g[0],iy-g[1])<=getattr(self,'approach_cells',0):
+            h=self.occ_hard[i]   # Zielanfahrt: nur der Mindestabstand zaehlt
+            return h>=50 and h!=255
+        return True
 
     def neighbors(self,ix,iy):
         n=[(-1,0,1.0),(1,0,1.0),(0,-1,1.0),(0,1,1.0)]
@@ -131,6 +173,18 @@ class DijkstraPlanner(Node):
             nx,ny=ix+dx,iy+dy
             if self.in_bounds(nx,ny) and not self.is_occ(nx,ny):
                 yield nx,ny,c
+
+    def nearest_free(self,ix,iy,max_r_m=1.5):
+        """Naechste freie Zelle (Breitensuche) um (ix,iy), max. max_r_m entfernt."""
+        max_r=int(math.ceil(max_r_m/self.res)) if self.res>0.0 else 0
+        seen={(ix,iy)}; q=[(ix,iy)]
+        for x,y in q:
+            if abs(x-ix)>max_r or abs(y-iy)>max_r: continue
+            if self.in_bounds(x,y) and not self.is_occ(x,y): return (x,y)
+            for dx,dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
+                n=(x+dx,y+dy)
+                if n not in seen and self.in_bounds(*n): seen.add(n); q.append(n)
+        return None
 
     def dijkstra(self,start,goal):
         sx,sy,syaw=start; gx,gy=goal
@@ -160,6 +214,11 @@ class DijkstraPlanner(Node):
             cur=(prev[cur][0],prev[cur][1])
         path.reverse()
         return path
+
+    def publish_no_path(self):
+        # Leerer Pfad = "kein Weg": nav2point haelt an (statt dem alten Pfad
+        # weiter zu folgen) und meldet no_path an die Bedienoberflaeche.
+        self.publish_path([],self.map_frame)
 
     def publish_path(self,pts,frame_id):
         path=Path()

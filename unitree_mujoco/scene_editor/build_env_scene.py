@@ -35,6 +35,7 @@ Aufruf:
 """
 import argparse
 import hashlib
+import json
 import math
 import os
 import re
@@ -48,6 +49,18 @@ GRASP_PREFIX_RE = re.compile(r"^grasp_", re.IGNORECASE)
 # Es wird beim Kombinieren entfernt und als <custom><numeric name="g1_spawn"
 # data="x y yaw"/> abgelegt; unitree_mujoco.py setzt den Roboter dorthin.
 SPAWN_PREFIX_RE = re.compile(r"^g1_spawn", re.IGNORECASE)
+# Stations-Markierungen: Objekte "station_<Name>" (beliebig viele) = Ziele fuer
+# die Stations-Knoepfe der Demo-GUI (AUTO NAV). Position = Ziel, Drehung um z =
+# Blickrichtung am Ziel. Werden wie g1_spawn entfernt (kein Hindernis) und als
+# <custom><numeric name="station_<Name>" data="x y yaw"/> abgelegt; der
+# Szenen-Publisher schickt sie mit nach ROS (/scene_markers, ns g1scene:station).
+STATION_PREFIX_RE = re.compile(r"^station_", re.IGNORECASE)
+# Anbauteile an Greif-Objekten: ein Geom "<grasp-Name>__<beliebig>" (z.B.
+# "grasp_klt__rippe_links") wird beim Kombinieren in den freien Koerper seines
+# Greif-Objekts gehaengt (Pose relativ umgerechnet) -- so lassen sich z.B. Rippen/
+# Griffleisten an ein Mesh anbauen, ohne das Mesh zu aendern (dessen Kollision
+# ist die konvexe Huelle, Vorspruenge im Mesh wuerden dort verschwinden).
+ATTACH_SEP = "__"
 
 HERE = Path(__file__).resolve().parent          # .../unitree_mujoco/scene_editor
 MJ_ROOT = HERE.parent                            # .../unitree_mujoco
@@ -158,7 +171,28 @@ def _wrap_grasp_geom(geom_el):
 
 
 def _is_grasp_geom(el) -> bool:
-    return el.tag == "geom" and bool(GRASP_PREFIX_RE.match(el.get("name") or ""))
+    return (el.tag == "geom" and bool(GRASP_PREFIX_RE.match(el.get("name") or ""))
+            and ATTACH_SEP not in (el.get("name") or ""))
+
+
+def _attach_parts(body_el, parts, warnings):
+    """Anbauteile (Welt-Pose) als Geoms relativ zum Greif-Koerper anhaengen."""
+    bpos = _floats(body_el.get("pos"), (0.0, 0.0, 0.0))
+    bq = _floats(body_el.get("quat"), (1.0, 0.0, 0.0, 0.0))
+    bq_inv = [bq[0], -bq[1], -bq[2], -bq[3]]
+    for g in parts:
+        gpos = _floats(g.get("pos"), (0.0, 0.0, 0.0))
+        gq = _floats(g.get("quat"), (1.0, 0.0, 0.0, 0.0))
+        new = ET.Element("geom", dict(g.attrib))
+        new.set("pos", _fmt(_quat_rotate(bq_inv, [a - b for a, b in zip(gpos, bpos)])))
+        new.set("quat", _fmt(_quat_mul(bq_inv, gq)))
+        try:   # Masse 0 (statischer Editor-Export) an bewegtem Koerper -> Dichte
+            if float(new.get("mass", "1")) <= 0.0:
+                new.attrib.pop("mass")
+        except ValueError:
+            pass
+        body_el.append(new)
+        warnings.append(f"  i Anbauteil '{g.get('name')}' an '{body_el.get('name')}' gehaengt.")
 
 
 def _floats(s, default):
@@ -214,31 +248,189 @@ def _normalize_free_body(body_el) -> None:
     geom.attrib.pop("quat", None)
 
 
-def _decompose_cached(mesh_abs: Path):
-    """Konvexe Zerlegung (V-HACD) eines Meshes, gecacht nach Datei-Inhalt.
+# V-HACD arbeitet auf einem Voxelgitter mit VHACD_RESOLUTION Voxeln ueber die
+# Bounding-Box -- bei einem 5 m breiten Arbeitsplatz ist ein Voxel ~4 cm gross.
+# Die Teil-Huellen stehen darum bis zu einem Voxel UEBER der echten Tischplatte
+# und haben schraege Oberseiten (gemessen 1-2.5 Grad): abgelegte Objekte liegen
+# dann auf einer Rampe und kriechen ueber die Zeit vom Tisch. Abhilfe in
+# _flatten_support_plates: grosse, ebene, waagrechte Rechtecke im Original-Mesh
+# (Tischplatten, Regalboeden) werden erkannt, die Huellen dort knapp oberhalb
+# der Platte ausgeschnitten und die Platte selbst als exakte Box ergaenzt.
+VHACD_RESOLUTION = 400000
+# Version der Nachbearbeitung -- hochzaehlen, wenn sich das Verfahren aendert
+# (eigener Cache-Unterordner, die teure V-HACD-Zerlegung bleibt erhalten).
+FLATTEN_VERSION = "flat_v1"
+PLATE_MIN_AREA = 0.05      # m^2: kleinere waagrechte Flaechen sind keine Ablage
+PLATE_MIN_HEIGHT = 0.10    # m ueber Mesh-Unterkante: Fussplatten/Boden ignorieren
+PLATE_BOX_THICKNESS = 0.02  # m: Dicke der exakten Kollisions-Box unter der Platte
+# m: Huellen enden so weit UNTER der Platte -- sonst liegen ihre (jetzt ebenen)
+# Oberseiten deckungsgleich mit der Box, die doppelten Kontakte lassen
+# abgelegte Objekte zittern und langsam wandern.
+PLATE_HULL_GAP = 0.002
 
-    Gibt die Liste der Teil-Huellen (STL-Pfade) zurueck; None, wenn trimesh/
-    vhacdx fehlen (dann bleibt das Mesh wie bisher).
+
+def _decompose_cached(mesh_abs: Path):
+    """Konvexe Zerlegung (V-HACD) eines Meshes, gecacht nach Datei-Inhalt,
+    mit begradigten Ablageflaechen (siehe _flatten_support_plates).
+
+    Gibt (Teil-Huellen als STL-Pfade, Ablageflaechen) zurueck; (None, []),
+    wenn trimesh/vhacdx fehlen (dann bleibt das Mesh wie bisher).
     """
     digest = hashlib.sha1(mesh_abs.read_bytes()).hexdigest()[:10]
     out_dir = COLLISION_CACHE / f"{mesh_abs.stem}-{digest}"
-    hulls = sorted(out_dir.glob("hull_*.stl"))
-    if hulls:
-        return hulls
+    flat_dir = out_dir / FLATTEN_VERSION
+    pieces = sorted(flat_dir.glob("part_*.stl"))
+    if pieces and (flat_dir / "plates.json").is_file():
+        return pieces, json.loads((flat_dir / "plates.json").read_text())
     try:
         import trimesh
     except ImportError:
-        return None
+        return None, []
     mesh = trimesh.load(str(mesh_abs), force="mesh")
-    parts = trimesh.decomposition.convex_decomposition(
-        mesh, maxConvexHulls=64, resolution=400000, maxRecursionDepth=12)
-    if isinstance(parts, dict):
-        parts = [parts]
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for i, part in enumerate(parts):
-        trimesh.Trimesh(part["vertices"], part["faces"]).export(
-            str(out_dir / f"hull_{i:02d}.stl"))
-    return sorted(out_dir.glob("hull_*.stl"))
+    hulls = sorted(out_dir.glob("hull_*.stl"))
+    if not hulls:
+        parts = trimesh.decomposition.convex_decomposition(
+            mesh, maxConvexHulls=64, resolution=VHACD_RESOLUTION, maxRecursionDepth=12)
+        if isinstance(parts, dict):
+            parts = [parts]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i, part in enumerate(parts):
+            trimesh.Trimesh(part["vertices"], part["faces"]).export(
+                str(out_dir / f"hull_{i:02d}.stl"))
+        hulls = sorted(out_dir.glob("hull_*.stl"))
+    return _flatten_support_plates(mesh, hulls, flat_dir)
+
+
+def _support_plates(mesh):
+    """Ebene, waagrechte, nach oben zeigende Rechtecke im Mesh (Tischplatten,
+    Regalboeden): Liste [x0, x1, y0, y1, z] im Mesh-Koordinatensystem."""
+    import numpy as np
+    tri = mesh.triangles
+    up = (mesh.face_normals[:, 2] > 0.9999) & (np.ptp(tri[:, :, 2], axis=1) < 5e-4)
+    z_of = np.round(tri[up, :, 2].mean(axis=1), 3)
+    area = mesh.area_faces[up]
+    z_min = mesh.bounds[0][2]
+    plates = []
+    for z in np.unique(z_of):
+        sel = z_of == z
+        a = float(area[sel].sum())
+        if a < PLATE_MIN_AREA or z < z_min + PLATE_MIN_HEIGHT:
+            continue
+        pts = tri[up][sel].reshape(-1, 3)
+        (x0, y0), (x1, y1) = pts[:, :2].min(axis=0), pts[:, :2].max(axis=0)
+        # nur (fast) volle Rechtecke -- sonst wuerde der Ausschnitt ueber
+        # Aussparungen hinweg echte Geometrie entfernen
+        if a < 0.95 * (x1 - x0) * (y1 - y0):
+            continue
+        plates.append([float(x0), float(x1), float(y0), float(y1), float(pts[:, 2].max())])
+    return plates
+
+
+def _clip_convex(faces, n, c, eps=1e-9):
+    """Konvexes Polyeder (Liste von Polygonen) auf den Halbraum n.p <= c
+    beschneiden; die Schnittflaeche wird als neues Polygon ergaenzt."""
+    import numpy as np
+    out, cap, cut = [], [], False
+    for poly in faces:
+        res = []
+        for i in range(len(poly)):
+            a, b = poly[i], poly[(i + 1) % len(poly)]
+            da, db = float(n @ a) - c, float(n @ b) - c
+            if da <= eps:
+                res.append(a)
+            else:
+                cut = True
+            if (da < -eps < eps < db) or (db < -eps < eps < da):
+                res.append(a + (b - a) * (da / (da - db)))
+        cap.extend(p for p in res if abs(float(n @ p) - c) <= 1e-7)
+        if len(res) >= 3:
+            out.append(np.array(res))
+    if cut and out:
+        pts = np.unique(np.round(np.array(cap), 9), axis=0) if cap else np.zeros((0, 3))
+        if len(pts) >= 3:
+            ctr = pts.mean(axis=0)
+            u = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])
+            u /= np.linalg.norm(u)
+            v = np.cross(n, u)
+            ang = np.arctan2((pts - ctr) @ v, (pts - ctr) @ u)
+            out.append(pts[np.argsort(ang)])
+    return out
+
+
+def _convex_mesh(faces):
+    """Polygone -> (Vertices, Dreiecke nach aussen orientiert, Volumen)."""
+    import numpy as np
+    verts, tris = [], []
+    for poly in faces:
+        base = len(verts)
+        verts.extend(poly)
+        tris.extend([base, base + k, base + k + 1] for k in range(1, len(poly) - 1))
+    verts, tris = np.array(verts), np.array(tris, dtype=int)
+    inner = verts.mean(axis=0)
+    a, b, c = (verts[tris[:, k]] for k in range(3))
+    det = np.einsum("ij,ij->i", np.cross(b - a, c - a), a - inner)
+    tris[det < 0] = tris[det < 0][:, ::-1]
+    return verts, tris, float(np.abs(det).sum() / 6.0)
+
+
+def _carve_plate(faces, plate, band):
+    """Den Quader [x0,x1]x[y0,y1]x[z, z+band] aus einem konvexen Teil
+    entfernen (unten PLATE_HULL_GAP tiefer, siehe dort). Ergebnis: bis zu 6
+    konvexe Teile (darunter, darueber, 4 Seiten)."""
+    import numpy as np
+    x0, x1, y0, y1, z = plate
+    ex, ey, ez = np.eye(3)
+    clip = _clip_convex
+    z -= PLATE_HULL_GAP
+    band += PLATE_HULL_GAP
+    mid = clip(clip(faces, -ez, -z), ez, z + band)
+    inner_x = clip(clip(mid, -ex, -x0), ex, x1)
+    return [clip(faces, ez, z), clip(faces, -ez, -(z + band)),
+            clip(mid, ex, x0), clip(mid, -ex, -x1),
+            clip(inner_x, ey, y0), clip(inner_x, -ey, -y1)]
+
+
+def _flatten_support_plates(mesh, hulls, flat_dir: Path):
+    """Teil-Huellen ueber Ablageflaechen ausschneiden (siehe VHACD_RESOLUTION).
+
+    Ueber jeder erkannten Platte wird ein Band von ~2 Voxeln Hoehe aus allen
+    Huellen entfernt (dort steht nur Ueberhang der Voxelisierung, keine echte
+    Geometrie); die Platte selbst liefert add_collision_hulls als exakte Box.
+    """
+    import numpy as np
+    import trimesh
+    plates = _support_plates(mesh)
+    voxel = (float(np.prod(mesh.extents)) / VHACD_RESOLUTION) ** (1.0 / 3.0)
+    band = 2.0 * voxel + 0.01
+    pieces = []
+    for hull_path in hulls:
+        h = trimesh.load(str(hull_path), force="mesh")
+        parts = [list(h.triangles)]
+        for x0, x1, y0, y1, z in plates:
+            nxt = []
+            for faces in parts:
+                v = np.concatenate(faces)
+                lo, hi = v.min(axis=0), v.max(axis=0)
+                if (hi[0] <= x0 or lo[0] >= x1 or hi[1] <= y0 or lo[1] >= y1
+                        or hi[2] <= z - PLATE_HULL_GAP or lo[2] >= z + band):
+                    nxt.append(faces)
+                    continue
+                nxt.extend(f for f in _carve_plate(faces, (x0, x1, y0, y1, z), band)
+                           if len(f) >= 4)
+            parts = nxt
+        for faces in parts:
+            if len(faces) < 4:
+                continue
+            verts, tris, vol = _convex_mesh(faces)
+            if vol > 1e-5:   # Splitter < 10 cm^3 weglassen (UDP-Grenze, siehe scene_state_publisher)
+                pieces.append((verts, tris))
+    flat_dir.mkdir(parents=True, exist_ok=True)
+    for old in flat_dir.glob("part_*.stl"):
+        old.unlink()
+    for i, (verts, tris) in enumerate(pieces):
+        trimesh.Trimesh(verts, tris, process=True).export(str(flat_dir / f"part_{i:03d}.stl"))
+    (flat_dir / "plates.json").write_text(json.dumps(plates))
+    return sorted(flat_dir.glob("part_*.stl")), plates
 
 
 def add_collision_hulls(geom_el, mesh_abs: Path, mesh_scale, asset, wb, warnings) -> None:
@@ -250,8 +442,11 @@ def add_collision_hulls(geom_el, mesh_abs: Path, mesh_scale, asset, wb, warnings
     bleibt nichts. Darum: das Original-Mesh nur noch als Optik (contype/
     conaffinity 0), die Kollision uebernehmen die Teile der Zerlegung (group 3
     = im Viewer standardmaessig ausgeblendet) in einem Body mit derselben Pose.
+    Ablageflaechen (Tischplatten, Regalboeden) kommen als exakte, waagrechte
+    Boxen dazu, damit abgelegte Objekte nicht auf schraegen Huellen-Flaechen
+    liegen und langsam herunterrutschen.
     """
-    hulls = _decompose_cached(mesh_abs)
+    hulls, plates = _decompose_cached(mesh_abs)
     if not hulls:
         warnings.append(f"  ! Mesh '{geom_el.get('mesh')}': keine Kollisions-Zerlegung "
                         "(trimesh fehlt) -> Kollision nur ueber konvexe Huelle.")
@@ -266,20 +461,27 @@ def add_collision_hulls(geom_el, mesh_abs: Path, mesh_scale, asset, wb, warnings
     for attr in ORIENT_ATTRS:
         if geom_el.get(attr):
             body.set(attr, geom_el.get(attr))
+    contact = {attr: geom_el.get(attr) for attr in CONTACT_ATTRS if geom_el.get(attr)}
     for i, hull in enumerate(hulls):
         mesh_name = f"{geom_el.get('mesh')}_hull{i:02d}"
         mesh_attrs = {"name": mesh_name, "file": rel_to_meshdir(hull)}
         if mesh_scale:
             mesh_attrs["scale"] = mesh_scale
         ET.SubElement(asset, "mesh", mesh_attrs)
-        hull_attrs = {"type": "mesh", "mesh": mesh_name, "group": "3",
-                      "rgba": "0.9 0.3 0.3 0.4"}
-        for attr in CONTACT_ATTRS:
-            if geom_el.get(attr):
-                hull_attrs[attr] = geom_el.get(attr)
-        ET.SubElement(body, "geom", hull_attrs)
+        ET.SubElement(body, "geom", {"type": "mesh", "mesh": mesh_name, "group": "3",
+                                     "rgba": "0.9 0.3 0.3 0.4", **contact})
+    sx, sy, sz = _floats(mesh_scale, (1.0, 1.0, 1.0))
+    t = PLATE_BOX_THICKNESS
+    for k, (x0, x1, y0, y1, z) in enumerate(plates):
+        ET.SubElement(body, "geom", {
+            "name": f"{base}__platte{k}", "type": "box", "group": "3",
+            "rgba": "0.3 0.9 0.3 0.4",
+            "pos": _fmt((sx * (x0 + x1) / 2, sy * (y0 + y1) / 2, sz * z - t / 2)),
+            "size": _fmt((abs(sx * (x1 - x0)) / 2, abs(sy * (y1 - y0)) / 2, t / 2)),
+            **contact})
     warnings.append(f"  i Mesh '{geom_el.get('mesh')}': Kollision ueber {len(hulls)} "
-                    "konvexe Teile (Viewer: Gruppe 3 einblenden zum Ansehen).")
+                    f"konvexe Teile + {len(plates)} Ablageflaeche(n) "
+                    "(Viewer: Gruppe 3 einblenden zum Ansehen).")
 
 
 def merge_environment(env_root, asset, wb, env_dir, warnings):
@@ -323,6 +525,15 @@ def merge_environment(env_root, asset, wb, env_dir, warnings):
             if nm:
                 used_asset_names.add(nm)
 
+    # Anbauteile einsammeln (gehoeren in den Koerper ihres Greif-Objekts)
+    attach = {}
+    for env_wb in env_root.findall("worldbody"):
+        for el in list(env_wb):
+            nm = el.get("name") or ""
+            if el.tag == "geom" and ATTACH_SEP in nm and GRASP_PREFIX_RE.match(nm):
+                attach.setdefault(nm.split(ATTACH_SEP)[0], []).append(el)
+                env_wb.remove(el)
+
     for env_wb in env_root.findall("worldbody"):
         for el in list(env_wb):
             if el.tag == "light":
@@ -330,7 +541,9 @@ def merge_environment(env_root, asset, wb, env_dir, warnings):
             if el.tag == "geom" and el.get("type") == "plane":
                 continue  # Boden kommt aus der Basis
             if _is_grasp_geom(el):
-                wb.append(_wrap_grasp_geom(el))
+                body = _wrap_grasp_geom(el)
+                _attach_parts(body, attach.pop(el.get("name"), []), warnings)
+                wb.append(body)
                 continue
             if el.tag == "body":
                 _normalize_free_body(el)
@@ -338,6 +551,10 @@ def merge_environment(env_root, asset, wb, env_dir, warnings):
             if el.tag == "geom" and el.get("type") == "mesh" and el.get("mesh") in env_meshes:
                 mesh_abs, mesh_scale = env_meshes[el.get("mesh")]
                 add_collision_hulls(el, mesh_abs, mesh_scale, asset, wb, warnings)
+
+    for parent, parts in attach.items():
+        warnings.append(f"  ! Anbauteile ohne Greif-Objekt '{parent}' ignoriert: "
+                        + ", ".join(g.get("name") for g in parts))
 
     # Kollisions-Bits der Umgebung: Koerper-Geoms des G1 kollidieren auf Bit 1,
     # die Haende/Finger (Inspire) nur auf Bit 2 (damit sie nicht am eigenen
@@ -372,6 +589,40 @@ def _reexec_in_editor_venv() -> None:
         os.execv(str(venv_py), [str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
+def _marker_xy_yaw(el):
+    """Position + Blickrichtung (Drehung um z) einer Markierung (geom oder body)."""
+    if el.tag == "body":
+        _normalize_free_body(el)
+        pos = _floats(el.get("pos"), (0.0, 0.0, 0.0))
+        quat = _floats(el.get("quat"), (1.0, 0.0, 0.0, 0.0))
+        inner = el.find("geom")
+        if inner is not None and inner.get("pos"):
+            pos = [a + b for a, b in zip(pos, _quat_rotate(quat, _floats(inner.get("pos"), (0, 0, 0))))]
+    else:
+        pos = _floats(el.get("pos"), (0.0, 0.0, 0.0))
+        quat = _floats(el.get("quat"), (1.0, 0.0, 0.0, 0.0))
+    w, x, y, z = quat
+    return pos, math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def extract_stations(env_root, warnings):
+    """Stations-Markierungen (station_...) aus der Umgebung entfernen und als
+    Liste [(name, x, y, yaw)] zurueckgeben (Reihenfolge wie in der Datei)."""
+    out = []
+    for env_wb in env_root.findall("worldbody"):
+        for el in list(env_wb):
+            names = [el.get("name") or ""] + [g.get("name") or "" for g in el.findall("geom")]
+            name = next((n for n in names if STATION_PREFIX_RE.match(n)), None)
+            if el.tag not in ("geom", "body") or name is None:
+                continue
+            env_wb.remove(el)
+            pos, yaw = _marker_xy_yaw(el)
+            out.append((name, pos[0], pos[1], yaw))
+            warnings.append(f"  i Station '{name}': x={pos[0]:.2f} y={pos[1]:.2f}, "
+                            f"Blickrichtung {math.degrees(yaw):.0f} Grad.")
+    return out
+
+
 def extract_spawn(env_root, warnings):
     """Startpunkt-Markierung (g1_spawn...) aus der Umgebung entfernen und
     (x, y, yaw) zurueckgeben -- oder None, wenn keine da ist (Start im Ursprung)."""
@@ -381,18 +632,7 @@ def extract_spawn(env_root, warnings):
             if el.tag not in ("geom", "body") or not any(SPAWN_PREFIX_RE.match(n) for n in names):
                 continue
             env_wb.remove(el)
-            if el.tag == "body":
-                _normalize_free_body(el)
-                pos = _floats(el.get("pos"), (0.0, 0.0, 0.0))
-                quat = _floats(el.get("quat"), (1.0, 0.0, 0.0, 0.0))
-                inner = el.find("geom")
-                if inner is not None and inner.get("pos"):
-                    pos = [a + b for a, b in zip(pos, _quat_rotate(quat, _floats(inner.get("pos"), (0, 0, 0))))]
-            else:
-                pos = _floats(el.get("pos"), (0.0, 0.0, 0.0))
-                quat = _floats(el.get("quat"), (1.0, 0.0, 0.0, 0.0))
-            w, x, y, z = quat
-            yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+            pos, yaw = _marker_xy_yaw(el)
             warnings.append(f"  i Startpunkt '{names[0] or names[-1]}': G1 startet bei "
                             f"x={pos[0]:.2f} y={pos[1]:.2f}, Blickrichtung {math.degrees(yaw):.0f} Grad.")
             return pos[0], pos[1], yaw
@@ -433,10 +673,14 @@ def main() -> None:
     warnings = []
     mj, asset, wb = build_base(robot_file, f"g1_env_{name}")
     spawn = extract_spawn(env_root, warnings)
+    stations = extract_stations(env_root, warnings)
     merge_environment(env_root, asset, wb, env_dir, warnings)
-    if spawn is not None:
+    if spawn is not None or stations:
         custom = ET.SubElement(mj, "custom")
-        ET.SubElement(custom, "numeric", {"name": "g1_spawn", "data": _fmt(spawn)})
+        if spawn is not None:
+            ET.SubElement(custom, "numeric", {"name": "g1_spawn", "data": _fmt(spawn)})
+        for name, x, y, yaw in stations:
+            ET.SubElement(custom, "numeric", {"name": name, "data": _fmt((x, y, yaw))})
 
     ET.indent(mj, space="  ")
     header = (

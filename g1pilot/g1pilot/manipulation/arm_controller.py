@@ -168,6 +168,17 @@ class ArmController(Node):
         # (Positionsspeicher, siehe g1pilot/docs/11_arm_manipulation_technik.md (Positionsspeicher)) als erreicht
         # gilt und der naechste Wegpunkt drankommt.
         self.declare_parameter("planned_motion_tolerance", 0.02)
+        # Reine Hand-Posen (nur left_hand/right_hand): so lange nach dem Senden
+        # warten, bis "reached" gemeldet wird (Inspire schliesst voll in ~1.3 s).
+        self.declare_parameter("hand_only_settle_s", 1.8)
+        # Glaettung (wie ik_alpha) NUR fuer geplante Pose-Fahrten. Der Pfad des
+        # Planers ist schon glatt; ik_alpha=0.2 macht die Fahrt zaeh (effektiv
+        # 20 % der erlaubten Gelenkgeschwindigkeit + langer Kriech-Schwanz).
+        # Default = ik_alpha (Real unveraendert), bringup_sim setzt 1.0.
+        self.declare_parameter("planned_motion_alpha", -1.0)
+        # walk_ready erst, wenn die GEMESSENEN Armgelenke so nah an der Lauf-Pose
+        # sind (Norm ueber 14 Gelenke, rad).
+        self.declare_parameter("walk_ready_measured_tolerance", 0.25)
         # Daempfung [kd] der Arm-Gelenke im E-Stop/Slack-Zustand. kp=0/tau=0 ->
         # keine Positionshaltung; kleines kd -> die Arme sacken GEDAEMPFT statt
         # frei zu fallen (an Seilen abgefangen). 0.0 = voellig frei (harter Fall).
@@ -350,14 +361,9 @@ class ArmController(Node):
         self.declare_parameter("home_right", [0.3, -0.2, 0.0, 0.5, 0.0, 0.0, 0.0])
         self.home_left  = np.array(self.get_parameter("home_left").value,  dtype=float)
         self.home_right = np.array(self.get_parameter("home_right").value, dtype=float)
-        # Ziel des HOMING-ARMS-Buttons (getrennt von home_*, das auch die IK-
-        # Ruhepose ist). Default Nullpose: Oberarm haengt, Unterarm 90 grad nach
-        # vorn, Haende vor dem Koerper auf ~Tischhoehe -- gute Ausgangslage am
-        # Arbeitsplatz. Angefahren wird GEPLANT (um Tisch/Koerper herum).
-        self.declare_parameter("homing_left",  [0.0] * 7)
-        self.declare_parameter("homing_right", [0.0] * 7)
-        self.homing_left  = np.array(self.get_parameter("homing_left").value,  dtype=float)
-        self.homing_right = np.array(self.get_parameter("homing_right").value, dtype=float)
+        # Ziel des HOMING-ARMS-Buttons (Streamdeck) bzw. »Grundstellung« (Demo-GUI):
+        # die Lauf-Pose walk_left/right weiter unten (Arme neben dem Koerper).
+        # Frueher Nullpose (Unterarm waagerecht nach vorn) -- siehe _homing_goals.
 
         # Ruhe-Pose fuer die IK-Nullraum-Regularisierung = Home-Pose. Haelt den
         # redundanten (7. DOF) Ellbogen-Swivel natuerlich -> der Arm faellt beim
@@ -1152,20 +1158,11 @@ class ArmController(Node):
             self._start_planned_motion(label, ["left", "right"], goals, {}, source="homing")
 
     def _homing_goals(self):
-        """Ziel fuers Homing: die Homing-Pose (homing_left/right, Default
-        Nullpose) -- ausser sie laege am aktuellen Standort in einem Hindernis
-        (Roboter dicht am/unter dem Tisch). Dann die Lauf-Pose (Haende naeher
-        am Koerper) als sichere Ruhe-Pose."""
-        home = {"left": self.homing_left.copy(), "right": self.homing_right.copy()}
-        try:
-            full = self._full_config_with_arms(np.concatenate((self.homing_left, self.homing_right)))
-            if not self.ik_solver.environment_command_in_collision(full):
-                return home, "HOME"
-        except Exception as e:
-            self.get_logger().warn(f"HOMING: Umgebungs-Check fehlgeschlagen ({e}) -> HOME.")
-            return home, "HOME"
-        self.get_logger().info("HOMING: Homing-Pose laege im Hindernis (Tisch?) -> Lauf-Pose als Ruhe-Pose.")
-        return {"left": self.walk_left.copy(), "right": self.walk_right.copy()}, "HOME (Lauf-Pose, Tisch zu nah)"
+        """Ziel fuers Homing (Grundstellung): immer die Lauf-Pose -- Arme neben
+        dem Koerper, Haende auf Hueft-Hoehe. Liegt nah am Koerper und kollidiert
+        daher auch dicht am Tisch nicht (die fruehere Nullpose mit Unterarmen
+        nach vorn musste dort auf die Lauf-Pose ausweichen)."""
+        return {"left": self.walk_left.copy(), "right": self.walk_right.copy()}, "HOME (Lauf-Pose)"
 
     def _align_ik_to_config(self, left_q, right_q):
         """IK-Ziele auf die gegebene Arm-Konfiguration setzen -> die Arme HALTEN dort,
@@ -1600,6 +1597,9 @@ class ArmController(Node):
         entry = self._pose_store.get(name)
         if entry is None:
             self.get_logger().warn(f"Pose '{name}' nicht gefunden.")
+            # Endzustand melden -- sonst wartet ein Ablauf (Demo-GUI) ewig.
+            self._publish_cmd_status(ac.ST_REJECTED, reason=f"Pose '{name}' nicht gefunden.",
+                                     req_id="", source="pose_store")
             return
 
         # Welche Arme sind gespeichert? Reihenfolge fix (links, dann rechts) --
@@ -1614,9 +1614,20 @@ class ArmController(Node):
             return
 
         if not sides:
-            # Nur Handposition -- keine Armplanung noetig, sofort senden.
+            # Nur Handposition -- keine Armplanung noetig, sofort senden. "reached"
+            # erst, wenn die Finger Zeit zum Schliessen/Oeffnen hatten: Abläufe
+            # (Demo-GUI) warten auf diesen Endzustand, bevor der naechste Schritt
+            # (z.B. Anheben) losfaehrt.
             self._publish_hand_goals(hand_goals)
             self.get_logger().info(f"Pose '{name}': nur Handposition wiederhergestellt.")
+            self._publish_cmd_status(ac.ST_EXECUTING, req_id="", source="pose_store")
+            settle = float(self.get_parameter("hand_only_settle_s").value)
+            timer = None
+
+            def _done():
+                timer.cancel()
+                self._publish_cmd_status(ac.ST_REACHED, req_id="", source="pose_store")
+            timer = self.create_timer(max(settle, 0.05), _done)
             return
 
         self._start_planned_motion(f"Pose '{name}'", sides, goals, hand_goals,
@@ -1995,8 +2006,19 @@ class ArmController(Node):
             q_target = np.concatenate((self.walk_left, self.walk_right))
             # Sobald die Arme die Lauf-Pose erreicht haben: einmalig walk_ready melden,
             # damit loco_sim erst dann mit dem Laufen beginnt (Arme aufgeraeumt).
-            if (not self._walk_ready_sent
-                    and np.linalg.norm(q_target - self._last_q_target) < self.walk_ready_tolerance):
+            # Erst melden, wenn die Arme WIRKLICH unten sind (gemessen), nicht nur
+            # das Kommando -- sonst laeuft loco_sim los, waehrend die Arme noch
+            # aus der Sicheren Pose herunterschwingen (Laufen dann "komisch").
+            arms_there = np.linalg.norm(q_target - self._last_q_target) < self.walk_ready_tolerance
+            if arms_there and self.use_robot:
+                try:
+                    cur = self.get_current_motor_q()
+                    meas = np.array([cur[j] for j in LEFT_JOINT_INDICES_LIST + RIGHT_JOINT_INDICES_LIST])
+                    arms_there = np.linalg.norm(q_target - meas) < float(
+                        self.get_parameter("walk_ready_measured_tolerance").value)
+                except Exception:
+                    pass
+            if not self._walk_ready_sent and arms_there:
                 self._walk_ready_sent = True
                 self.walk_ready_publisher.publish(Bool(data=True))
                 self.get_logger().info("Lauf-Pose erreicht -> walk_ready (Arme aufgeraeumt).")
@@ -2129,10 +2151,21 @@ class ArmController(Node):
 
         dt = self._compute_dt()
         max_step = self.arm_velocity_limit * dt
-        dq = np.clip(q_target - self._last_q_target, -max_step, max_step)
+        # Richtungserhaltend skalieren statt je Gelenk zu clippen: sonst laufen
+        # Gelenke mit kleinem Weg frueh fertig und der Arm faehrt NICHT die vom
+        # Planer gepruefte Gerade, sondern einen Knick -- z.B. Sichere_Pose ->
+        # ueber den Tisch: Hand 6 cm in die Tischkante statt 12 cm darueber.
+        dq = q_target - self._last_q_target
+        dq_max = float(np.max(np.abs(dq)))
+        if dq_max > max_step:
+            dq = dq * (max_step / dq_max)
 
         q_unsmoothed = self._last_q_target + dq
-        q_smooth = (1.0 - self.ik_alpha) * self._last_q_target + self.ik_alpha * q_unsmoothed
+        alpha = self.ik_alpha
+        if self._planned_motion_active:
+            pa = float(self.get_parameter("planned_motion_alpha").value)
+            alpha = pa if pa > 0.0 else self.ik_alpha
+        q_smooth = (1.0 - alpha) * self._last_q_target + alpha * q_unsmoothed
         # Kartesisches Speedlimit (TCP + Ellbogen, ISO 10218-1 reduced speed):
         # begrenzt auch die Faelle, in denen ein kleiner Gelenkschritt eine
         # grosse Handbewegung erzeugt (gestreckter Arm, Schulterdrehung).

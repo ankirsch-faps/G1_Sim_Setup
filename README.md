@@ -35,11 +35,14 @@ Real läuft.
 ## Schnellstart
 
 ```bash
-git clone https://github.com/nilsmeier1812/g1simrepo.git
-cd g1simrepo/g1pilot
+git clone https://github.com/NilsMeier1812/G1.git
+cd G1/g1pilot
 make build-sim
 make sim
 ```
+
+Echter Roboter: Schritt für Schritt vom frischen PC bis zur Demo-GUI in
+[g1pilot/docs/70_echtroboter_anleitung.md](g1pilot/docs/70_echtroboter_anleitung.md).
 
 Ausführliche Installationsanleitung (Linux, Windows/WSL2, Voraussetzungen):
 [g1pilot/docs/01_installation.md](g1pilot/docs/01_installation.md).
@@ -75,7 +78,7 @@ und ist nach Themen gegliedert. Jedes Thema hat zwei Dokumente: eine
 │   ├── docs/                    vollständige Dokumentation
 │   ├── g1pilot/                 Node-Quellcode (state, manipulation, navigation, teleoperation, utils)
 │   ├── launch/                  ROS-2-Launchdateien
-│   ├── policies/g1_wholebody/   RL-Lauf-Policy (ONNX)
+│   ├── policies/                RL-Lauf-Policies (ONNX, Sim): g1_wholebody (Standard), agile_velocity_g1, agile_velocity_height_g1
 │   └── docker/, docker-compose.yml
 ├── unitree_mujoco/               MuJoCo-Simulation (Unitree, angepasst)
 ├── unitree_ros2/                 Unitree-ROS-2-Abhängigkeiten

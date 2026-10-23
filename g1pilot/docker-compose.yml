@@ -46,6 +46,8 @@ services:
       - SIM_LOCKSTEP=${SIM_LOCKSTEP:-1}
       # Inspire-FTP-Haende laden (1) statt Rubber-Hand. config.py waehlt die Scene.
       - G1_INSPIRE_HANDS=${G1_INSPIRE_HANDS:-0}
+      # Diagnose: 1 = loco_sim loggt alle ~2 s Regeltakt/Neigung/Kommando (sonst nur bei Auffaelligkeit).
+      - G1_LOCO_DEBUG=${G1_LOCO_DEBUG:-0}
       # Umgebung: G1 bleibt gleich, nur die Welt wechselt. Leer/"default" =
       # bisheriges Terrain (scene.xml). Sonst laedt config.py die von start.sh
       # erzeugte kombinierte Szene scene_env_<G1_ENV>.xml. Siehe scene_editor/.
@@ -72,6 +74,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.sim
     image: g1pilot-sim:v1.1.0
+    # Handy-Zugang: Dockers AppArmor-Profil »docker-default« verbietet jeden System-D-Bus-Aufruf
+    # (journalctl: apparmor="DENIED" ... member="Hello"), BlueZ ist dann unerreichbar.
+    # Das Start-Fenster setzt G1_SIM_APPARMOR=unconfined nur mit Haken »Handy-Zugang«,
+    # sonst bleibt das Profil wie bisher. Der Real-Container ist privileged und betrifft das nicht.
+    security_opt:
+      - apparmor=${G1_SIM_APPARMOR:-docker-default}
     environment:
       - DISPLAY=${DISPLAY}
       - G1_SIM_MODE=true          # ← Aktiviert Simulation in Python-Code
@@ -96,12 +104,24 @@ services:
       # Inspire-Haende: bringup_sim.launch.py startet dann inspire_hand und setzt
       # robot_state publish_hand_joints:=false (sonst doppelte Finger-/joint_states).
       - G1_INSPIRE_HANDS=${G1_INSPIRE_HANDS:-0}
+      # Bezug der Controller-/GUI-Jogs (command | start | tf), siehe Real-Service.
+      - G1_JOG_REFERENCE=${G1_JOG_REFERENCE:-command}
       # Navigation (g1pilot-Ansatz) in der Sim mitstarten: dijkstra_planner +
       # nav2point + Sim-Glue (sim_localization, joy_to_cmdvel). Siehe g1pilot/docs/50_navigation_anleitung.md.
       - G1_ENABLE_NAV=${G1_ENABLE_NAV:-0}
+      # Lauf-Policy von loco_sim (Ordner unter g1pilot/policies), im Startmenue
+      # waehlbar: g1_wholebody (Default, alt) | agile_velocity_g1 |
+      # agile_velocity_height_g1. Siehe g1pilot/docs/31_loco_technik.md.
+      - G1_WALK_POLICY=${G1_WALK_POLICY:-g1_wholebody}
       # Bedienoberflaeche: streamdeck (Default) | demo (vereinfachte Demo-GUI,
       # siehe g1pilot/docs/42_demo_gui_konzept.md).
       - G1_GUI=${G1_GUI:-streamdeck}
+      - G1_GUI_FULLSCREEN=${G1_GUI_FULLSCREEN:-0}
+      # Handy-Bedienung ueber Bluetooth LE (nur Demo-GUI, docs/44_handy_bedienung.md).
+      # 0 = aus (kein Werben, kein Thread). Adapter: hci0 = einziger Dongle (teilt
+      # sich den Funk mit dem Controller), hci1 = zweiter Dongle nur fuers Handy.
+      - G1_PHONE=${G1_PHONE:-0}
+      - G1_PHONE_BT_ADAPTER=${G1_PHONE_BT_ADAPTER:-auto}
       # Szenen-Bruecke (siehe g1pilot/docs/51_navigation_technik.md): MUSS zum mujoco-sim-Wert oben passen.
       - SIM_SCENE_PORT=${SIM_SCENE_PORT:-47902}
     volumes:
@@ -113,6 +133,14 @@ services:
       # liegt nur im mujoco-sim-Container). Fixer Pfad, den scene_bridge.py als
       # mesh_resource_prefix-Default erwartet.
       - ../unitree_mujoco/scene_editor/meshes:/scene_meshes:ro
+      # Robotermodell der Sim (MJCF) read-only: loco_sim rechnet daraus den
+      # Schwerpunkt fuer den Stand-Balancer (navigation/com_model.py, Parameter
+      # robot_mjcf). Fixer Pfad = loco_sim-Default.
+      - ../unitree_mujoco/unitree_robots/g1:/unitree_mujoco/unitree_robots/g1:ro
+      # Handy-Bedienung: BlueZ auf dem Host ueber den System-D-Bus + Geraeteliste
+      # der gekoppelten Handys (bleibt ueber Container-Neustarts erhalten).
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - ${HOME}/.config/g1pilot:/root/.config/g1pilot
     command: >
       bash -c "cd /ros2_ws &&
                source /opt/ros/humble/setup.bash &&
@@ -156,6 +184,12 @@ services:
       - USE_RVIZ=${USE_RVIZ:-true}
       # Bedienoberflaeche: streamdeck (Default) | demo (siehe docs/42_demo_gui_konzept.md).
       - G1_GUI=${G1_GUI:-streamdeck}
+      - G1_GUI_FULLSCREEN=${G1_GUI_FULLSCREEN:-0}
+      # Handy-Bedienung ueber Bluetooth LE (nur Demo-GUI, docs/44_handy_bedienung.md).
+      # 0 = aus (kein Werben, kein Thread). Adapter: hci0 = einziger Dongle (teilt
+      # sich den Funk mit dem Controller), hci1 = zweiter Dongle nur fuers Handy.
+      - G1_PHONE=${G1_PHONE:-0}
+      - G1_PHONE_BT_ADAPTER=${G1_PHONE_BT_ADAPTER:-auto}
       # Inspire-FTP-Haende (Modbus TCP im Roboter-LAN).
       - G1_INSPIRE_HANDS=${G1_INSPIRE_HANDS:-0}
       - G1_HAND_LEFT_HOST=${G1_HAND_LEFT_HOST:-192.168.123.210}
@@ -163,6 +197,37 @@ services:
       - G1_HAND_PORT=${G1_HAND_PORT:-6000}
       # PS4-Controller-Gerätename (evdev); Bluetooth-PS4 = "Wireless Controller".
       - JOYSTICK_NAME=${JOYSTICK_NAME:-Wireless Controller}
+      # PS4-Controller: 0 = Gehen (alter joystick -> loco_client, Deadman),
+      # 1 = Arme + Haende, KEIN Laufen (docs/43_ps4_controller.md).
+      - G1_PS4_ARMS=${G1_PS4_ARMS:-0}
+      - G1_PS4_SPEED=${G1_PS4_SPEED:-Langsam}
+      - G1_PS4_MAX_SPEED=${G1_PS4_MAX_SPEED:-Normal}
+      - G1_PS4_PS_ESTOP=${G1_PS4_PS_ESTOP:-1}
+      # Bezug der Controller-/GUI-Jogs: command (Default, wie der RViz-Marker an
+      # der kommandierten Hand) | start | tf (alter Real-Stand, gemessene Hand).
+      - G1_JOG_REFERENCE=${G1_JOG_REFERENCE:-command}
+      # Controller: auto (PS4 oder Xbox) | ps4 | xbox; Xbox-NOT-HALT-Taste xbox | view.
+      - G1_CONTROLLER=${G1_CONTROLLER:-auto}
+      - G1_XBOX_PS_BUTTON=${G1_XBOX_PS_BUTTON:-xbox}
+      # Taille (Waist) halten, solange arm_sdk die Arme fuehrt (sonst kraftlos).
+      # Gains auf Hardware ungeprueft -- beim ersten Test am Seil anpassen.
+      - G1_WAIST_HOLD=${G1_WAIST_HOLD:-true}
+      - G1_WAIST_KP=${G1_WAIST_KP:-150.0}
+      - G1_WAIST_KD=${G1_WAIST_KD:-4.0}
+      # NOT-HALT: Taille bleibt gehalten, Beine nur StopMove (kein Damp).
+      # Alt-Verhalten: G1_ESTOP_WAIST_HOLD=false und/oder G1_ESTOP_DAMP_LEGS=1.
+      - G1_ESTOP_WAIST_HOLD=${G1_ESTOP_WAIST_HOLD:-true}
+      - G1_ESTOP_DAMP_LEGS=${G1_ESTOP_DAMP_LEGS:-0}
+      # LAUFEN: Arme bleiben in ihrer Pose (false) oder parken in der Lauf-Pose (true).
+      - G1_WALK_PARK_ARMS=${G1_WALK_PARK_ARMS:-false}
+      # Loco-RPC-Dienst (Unitree: 'loco' bis ai_sport 8.1, 'sport' ab 8.2).
+      - G1_LOCO_SERVICE=${G1_LOCO_SERVICE:-sport}
+      # Walk-Modus beim Start (Startleiste/LAUFEN): 501 = Walk with waist, 500 = Walk.
+      - G1_WALK_FSM_ID=${G1_WALK_FSM_ID:-501}
+      # Bodenkontakt vor Walk: Knie-Last je Knie >= G1_KNEE_LOAD_MIN_NM (Nm).
+      # G1_GROUND_CHECK=fsm_mode = alt (am Kran wirkungslos), none = ohne Pruefung.
+      - G1_GROUND_CHECK=${G1_GROUND_CHECK:-knee_load}
+      - G1_KNEE_LOAD_MIN_NM=${G1_KNEE_LOAD_MIN_NM:-10.0}
       # Konservative Walk-Limits fuer die ersten Tests (loco_client skaliert
       # die normierten UI-/PS4-Kommandos damit).
       - G1_MAX_VX=${G1_MAX_VX:-0.4}
@@ -173,13 +238,24 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - .:/ros2_ws/src/g1pilot:rw
       - /dev/input:/dev/input      # PS4-Controller (evdev)
+      # Handy-Bedienung: BlueZ auf dem Host ueber den System-D-Bus + Geraeteliste
+      # der gekoppelten Handys (bleibt ueber Container-Neustarts erhalten).
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - ${HOME}/.config/g1pilot:/root/.config/g1pilot
     command: >
       bash -c "cd /ros2_ws &&
                source /opt/ros/humble/setup.bash &&
                source /ros2_ws/install/setup.bash &&
                colcon build --packages-select g1pilot --symlink-install &&
                source /ros2_ws/install/setup.bash &&
-               ros2 launch g1pilot bringup_real.launch.py"
+               exec ros2 launch g1pilot bringup_real.launch.py"
+    # Beenden (Strg+C / docker compose down): `exec` macht ros2 launch zum
+    # Hauptprozess -> es bekommt das SIGTERM und gibt jedem Node SIGINT. Der
+    # arm_controller faehrt dann die Arme zurueck und rampt das arm_sdk-
+    # Gewicht 1->0 (sanfte Uebergabe an den Onboard-Regler). Ohne exec bekam
+    # die bash (PID 1) das Signal, ignorierte es, und nach 10 s riss SIGKILL
+    # alles ab. Die Frist deckt Rueckfahrt + Rampe + launch-Eskalation.
+    stop_grace_period: 20s
 
   g1pilot-real-full:
     # ── Voller Real-Stack (Livox MID360 + MOLA + Navigation) ───────────
@@ -204,6 +280,8 @@ services:
                source /ros2_ws/install/setup.bash &&
                colcon build --packages-select g1pilot --symlink-install &&
                source /ros2_ws/install/setup.bash &&
-               ros2 launch g1pilot bringup_launcher.launch.py
+               exec ros2 launch g1pilot bringup_launcher.launch.py
                  use_robot:=true
                  interface:=${ROBOT_INTERFACE:-eth0}"
+    # Siehe g1pilot-real: exec + Frist fuer die sanfte Arm-Uebergabe beim Beenden.
+    stop_grace_period: 20s

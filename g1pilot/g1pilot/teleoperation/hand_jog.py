@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+hand_jog.py — »Hand bewegen« ohne Qt/ROS: Quaternion-Helfer + ein Jog-Schritt.
+
+Gemeinsam genutzt von der Demo-GUI (Bildschirm-Joystick, demo_gui.py) und dem
+PS4-Controller (ps4_arm_teleop.py). Beide schicken kartesische Hand-Ziele im
+pelvis-Frame auf /g1pilot/hand_goal/<side>; der arm_controller loest per IK.
+
+Prinzip: Das Ziel startet an der Hand (kommandiert, sonst TF -- siehe
+JOG_CMD_TOPIC/JogReference) und wird mit der Soll-
+Geschwindigkeit verschoben/gedreht, laeuft der Hand (Bezug) aber hoechstens
+`lead_m` / `lead_rad` voraus. Sonst wuerde es weiterwandern, wenn der Arm
+nicht folgen kann (Gelenkgrenze, Tisch), und beim Loslassen noch lange
+nachfahren. Begrenzt wird der Vorlauf ENTLANG der Bewegungsrichtung; quer
+dazu bleibt das Ziel auf seiner Linie (siehe jog_step).
+"""
+import math
+
+# Hand-Ziele im pelvis-Frame, Hand-Pose per TF (wie RViz-Marker und Demo-GUI).
+JOG_FRAME = "pelvis"
+JOG_TF = {"left": "left_hand_point_contact", "right": "right_hand_point_contact"}
+
+# Startpose eines neuen Jog-Ziels: die KOMMANDIERTE Hand (FK der Soll-Gelenke,
+# vom arm_controller auf diesem Topic) statt der gemessenen (TF). Gemessen und
+# kommandiert unterscheiden sich um einen bleibenden Regelfehler (Durchhang,
+# Schwerkraft-Vorsteuerung, Gelenk-PD; in der Sim ~3 Grad Kippen + ~1 cm).
+# Startete jedes Jog-Ziel an der gemessenen Hand, uebernahm der Arm diesen
+# Versatz bei JEDER Fahrt erneut: die Hand kippte pro Fahrt ein Stueck weiter
+# (gemessen: nach 8x Tippen 9-18 Grad) und wanderte in den Nebenachsen.
+# 2026-10-21: auch Vorlauf-Begrenzung und Anhalten an der kommandierten Hand
+# (jog_reference "command", siehe JogReference). Am gemessenen Bezug hing das
+# Fahrtende am Schleppfehler/der Reibung des jeweiligen Arms: gespiegelte
+# Fahrten endeten links und rechts verschieden, Hin- und Rueckweg waren
+# ungleich lang. Der RViz-Marker hatte das nie -- der arm_controller faehrt
+# dort die KOMMANDIERTE Hand exakt aufs Ziel. Preis: die echte Hand laeuft
+# nach dem Loslassen um ihren Schleppfehler nach (in der Sim gemessen, siehe
+# docs/43_ps4_controller.md). Fehlt das Topic, laeuft die Fahrt an TF.
+JOG_CMD_TOPIC = "/g1pilot/hand_cmd_pose/{side}"
+# Aelter -> die kommandierte Pose gilt als unbekannt (arm_controller laeuft
+# nicht / WALK). Nicht zu knapp: in einer ueberlasteten Sim kommt das Topic
+# mit dem Regeltakt (teils nur 2-8 Hz), ein Wechsel auf TF mitten in der
+# Fahrt waere ein Bezugssprung.
+JOG_CMD_MAX_AGE_S = 1.0
+
+# Bezug des Jog-Ziels (Parameter jog_reference, Env G1_JOG_REFERENCE):
+#   "command" Start, Vorlauf UND Anhalten an der KOMMANDIERTEN Hand -- wie beim
+#             RViz-Marker: der Sollwert ist deterministisch (gleiche Eingabe ->
+#             gleiche Bahn, links/rechts gespiegelt gleich), Reibung, Durchhang
+#             und Schleppfehler der echten Hand fliessen nicht ins Ziel ein.
+#             Fehlt die kommandierte Pose beim Start, laeuft diese Fahrt an TF.
+#   "start"   nur der Start an der kommandierten Hand, Vorlauf/Anhalten an TF
+#             (Stand 2026-10-14, bisheriger Sim-Default).
+#   "tf"      alles an der gemessenen Hand (urspruengliches Verhalten, bisheriger
+#             Real-Default).
+JOG_REFERENCES = ("command", "start", "tf")
+JOG_REFERENCE_DEFAULT = "command"
+
+
+def jog_reference_mode(value=None):
+    """Gueltigen Bezug aus Parameter/Env (G1_JOG_REFERENCE) -> JOG_REFERENCES."""
+    import os
+    v = str(value if value is not None
+            else os.environ.get("G1_JOG_REFERENCE", JOG_REFERENCE_DEFAULT)).strip().lower()
+    return v if v in JOG_REFERENCES else JOG_REFERENCE_DEFAULT
+
+
+class JogReference:
+    """Welche Handpose ein Jog-Schritt als Bezug nimmt (siehe JOG_REFERENCES).
+
+    pose(side, cmd, tf, new) -> (start, ref)
+        cmd/tf: kommandierte bzw. gemessene Handpose (pos, quat) oder None.
+        new:    True beim ersten Schritt eines neuen Jog-Ziels.
+        start:  Startpose fuer jog_step (None -> Start an ref)
+        ref:    Bezug fuer Vorlauf-Begrenzung und Anhalten (None = unbekannt)
+    end(side) -> Fahrt vorbei (naechste beginnt neu).
+
+    Die Quelle wird je Fahrt beim Start festgelegt: kommt die kommandierte
+    Pose erst waehrend einer TF-Fahrt (erste Auto-Kalibrierung), wird nicht
+    mitten in der Fahrt umgeschaltet; faellt sie aus, geht es an TF weiter.
+    """
+
+    def __init__(self, mode=JOG_REFERENCE_DEFAULT):
+        self.mode = jog_reference_mode(mode)
+        self._src = {}
+
+    def pose(self, side, cmd, tf, new):
+        if self.mode == "tf":
+            return None, tf
+        if self.mode == "start":
+            return (cmd if new else None), tf
+        if new or side not in self._src:
+            self._src[side] = "command" if cmd is not None else "tf"
+        if self._src[side] == "command" and cmd is None:
+            self._src[side] = "tf"
+        return None, (cmd if self._src[side] == "command" else tf)
+
+    def end(self, side):
+        self._src.pop(side, None)
+
+
+class CommandedPoses:
+    """Letzte kommandierte Handpose je Seite (aus JOG_CMD_TOPIC) mit Alter.
+
+    update(side, pos, quat, now) -> merken
+    get(side, now)               -> (pos, quat) oder None (keine/zu alt)
+    """
+
+    def __init__(self, max_age_s=JOG_CMD_MAX_AGE_S):
+        self.max_age_s = float(max_age_s)
+        self._poses = {}
+
+    def update(self, side, pos, quat, now):
+        self._poses[side] = ((list(pos), tuple(quat)), now)
+
+    def get(self, side, now):
+        entry = self._poses.get(side)
+        if entry is None or now - entry[1] > self.max_age_s:
+            return None
+        return entry[0]
+
+# Tempo-Stufen bei Vollausschlag: (Verschieben m/s, Drehen rad/s).
+JOG_SPEEDS = {"Langsam": (0.05, math.radians(20)),
+              "Normal":  (0.15, math.radians(45)),
+              "Schnell": (0.30, math.radians(90))}
+JOG_SPEED_ORDER = ("Langsam", "Normal", "Schnell")
+
+# Vorlauf = JOG_LEAD_S x Tempo, mindestens JOG_MIN_LEAD_*. Zu knapp darf er
+# nicht sein: der arm_controller glaettet Ziele (ik_goal_filter_alpha), die
+# Hand haengt bei hohem Tempo einige cm hinterher -- ein fester kleiner
+# Vorlauf bremste sie aus.
+JOG_LEAD_S = 0.5
+JOG_MIN_LEAD_M = 0.04
+JOG_MIN_LEAD_RAD = math.radians(15)
+# Sicherheitsnetz: Abstand Ziel-Hand insgesamt (Vorlauf + Querversatz).
+JOG_MAX_LEAD_FACTOR = 1.5
+
+
+def qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def qconj(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def qfrom_rotvec(rx, ry, rz):
+    """Drehvektor (Achse * Winkel, rad) -> Quaternion (x, y, z, w)."""
+    ang = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if ang < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    s = math.sin(ang / 2) / ang
+    return (rx * s, ry * s, rz * s, math.cos(ang / 2))
+
+
+def qangle(a, b):
+    """Drehwinkel zwischen zwei Orientierungen (rad)."""
+    d = abs(sum(x * y for x, y in zip(a, b)))
+    return 2.0 * math.acos(min(1.0, d))
+
+
+def qslerp(a, b, t):
+    d = sum(x * y for x, y in zip(a, b))
+    if d < 0.0:
+        b, d = tuple(-x for x in b), -d
+    if d > 0.9995:
+        q = tuple(x + t * (y - x) for x, y in zip(a, b))
+    else:
+        th = math.acos(d)
+        sa, sb = math.sin((1 - t) * th), math.sin(t * th)
+        q = tuple((sa * x + sb * y) / math.sin(th) for x, y in zip(a, b))
+    n = math.sqrt(sum(x * x for x in q))
+    return tuple(x / n for x in q)
+
+
+def lead_limits(lin_speed, ang_speed):
+    """-> (lead_m, lead_rad): wie weit das Ziel der Hand vorauslaufen darf."""
+    return (max(JOG_MIN_LEAD_M, lin_speed * JOG_LEAD_S),
+            max(JOG_MIN_LEAD_RAD, ang_speed * JOG_LEAD_S))
+
+
+def jog_step(target, hand, lin, ang, dt, lead_m, lead_rad, start=None):
+    """Einen Jog-Schritt rechnen.
+
+    target : [pos(list3), quat(tuple4)] bisheriges Ziel (oder None -> Start bei
+             `start`, ohne `start` an der Hand)
+    hand   : (pos, quat) Bezugshand im JOG_FRAME (Vorlauf-Begrenzung) --
+             kommandiert oder gemessen, siehe JogReference
+    start  : (pos, quat) Startpose eines neuen Ziels, i.d.R. die KOMMANDIERTE
+             Hand (JOG_CMD_TOPIC) -- oder None
+    lin    : (vx, vy, vz) m/s im JOG_FRAME
+    ang    : (wx, wy, wz) rad/s um feste JOG_FRAME-Achsen, Drehpunkt = Hand
+    -> neues Ziel [pos, quat]
+    """
+    pos, rot = hand
+    if target is None:
+        sp0, sq0 = start if start is not None else hand
+        target = [list(sp0), tuple(sq0)]
+    # Verschieben, Vorlauf zur Hand (Bezug) begrenzen -- nur ENTLANG der
+    # Bewegungsrichtung. Frueher wurde das Ziel auf die Kugel um die Hand
+    # zurueckgezogen; dabei uebernahm es jede Querabweichung der Hand (IK-
+    # Restfehler, Nachziehen in Gelenkkoordinaten) und behielt sie: die Hand
+    # lief bei laengeren Fahrten schraeg weg (seitwaerts 9 cm -> 5 cm nach
+    # hinten). Quer bleibt das Ziel jetzt auf seiner Linie; als Sicherheitsnetz
+    # liegt es nie weiter als JOG_MAX_LEAD_FACTOR x lead_m von der Hand.
+    p = [target[0][i] + lin[i] * dt for i in range(3)]
+    d = [p[i] - pos[i] for i in range(3)]
+    sp = math.sqrt(sum(c * c for c in lin))
+    if sp > 1e-12:
+        u = [c / sp for c in lin]
+        along = sum(d[i] * u[i] for i in range(3))
+        if along > lead_m:
+            d = [d[i] - (along - lead_m) * u[i] for i in range(3)]
+    n = math.sqrt(sum(c * c for c in d))
+    n_max = JOG_MAX_LEAD_FACTOR * lead_m
+    if n > n_max:
+        d = [c * n_max / n for c in d]
+    p = [pos[i] + d[i] for i in range(3)]
+    # Drehen (feste Achsen -> von links multiplizieren), Vorlauf begrenzen
+    dq = qfrom_rotvec(*(w * dt for w in ang))
+    q = qmul(dq, target[1])
+    err = qangle(q, rot)
+    if err > lead_rad:
+        q = qslerp(rot, q, lead_rad / err)
+    return [p, q]
+
+
+def hold_pose(target, hand, lin, ang):
+    """Halte-Ziel beim Loslassen.
+
+    Entlang der letzten Bewegungsrichtung stoppt es an der Hand (Bezug) (der
+    Vorlauf faellt weg), quer dazu bleibt es auf der Linie des Ziels -- so
+    wird eine Querabweichung der Hand nicht als neue Ruhelage uebernommen.
+    Orientierung: nach Drehen die der Hand, nach reinem Verschieben die
+    des Ziels (die Hand soll ihre Ausrichtung behalten).
+    target : [pos, quat] laufendes Jog-Ziel oder None (-> Hand)
+    hand   : (pos, quat) Bezugshand (siehe JogReference)
+    lin/ang: letzte Sollbewegung (m/s, rad/s)
+    -> (pos, quat)
+    """
+    pos, rot = hand
+    if target is None:
+        return list(pos), tuple(rot)
+    tp, tq = target
+    sp = math.sqrt(sum(c * c for c in lin))
+    if sp > 1e-12:
+        u = [c / sp for c in lin]
+        along = sum((tp[i] - pos[i]) * u[i] for i in range(3))
+        p = [tp[i] - along * u[i] for i in range(3)]
+    else:
+        p = list(tp)        # nur gedreht: Position war fest
+    q = tuple(rot) if any(abs(c) > 1e-12 for c in ang) else tuple(tq)
+    return p, q
+
+
+# Halten nach dem Loslassen: der arm_controller glaettet Ziele PRO NACHRICHT
+# (ik_goal_filter_alpha = 0.25). Ein einzelnes Halte-Ziel zieht sein internes
+# Ziel nur 25 % zur Hand -- der Rest des Vorlaufs (mehrere cm) wuerde noch
+# abgefahren. Darum das Halte-Ziel JOG_HOLD_S lang weiter senden. Der
+# arm_controller nimmt hoechstens ein (das neueste) Ziel pro Regeltakt: real
+# (~30-50 Hz) kommen alle 30 an -> Restfehler 0.75^30 ~ 0 %, in einer langsamen
+# Sim (~14 Hz) immer noch 0.75^14 < 2 %.
+JOG_HOLD_S = 1.0
+
+
+class HoldStreamer:
+    """Halte-Ziele nach dem Loslassen eine Weile wiederholen.
+
+    hold(side, pose, now)  -> Ziel merken (pose = (pos, quat))
+    cancel(side)           -> Seite bewegt sich wieder, nicht mehr halten
+    due(now)               -> {side: pose}, die in diesem Takt zu senden sind
+    """
+
+    def __init__(self, hold_s=JOG_HOLD_S):
+        self.hold_s = float(hold_s)
+        self._held = {}     # side -> (pose, until)
+
+    def hold(self, side, pose, now):
+        self._held[side] = (pose, now + self.hold_s)
+
+    def cancel(self, side):
+        self._held.pop(side, None)
+
+    def clear(self):
+        self._held.clear()
+
+    def due(self, now):
+        out = {}
+        for side, (pose, until) in list(self._held.items()):
+            if now > until:
+                del self._held[side]
+            else:
+                out[side] = pose
+        return out

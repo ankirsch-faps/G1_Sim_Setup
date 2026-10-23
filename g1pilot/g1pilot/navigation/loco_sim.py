@@ -6,23 +6,40 @@ loco_sim — Hybrid-Loco-/Balance-Controller fuer die MuJoCo-Sim.
 Ersetzt im Sim das Unitree-Onboard-High-Level (LocoClient.BalanceStand/Move), das
 es in MuJoCo nicht gibt. KOMBINIERT zwei Regler, je nach Aufgabe:
 
-  * STAND (am Platz): modellbasierter Knoechel-/Hueft-PD. Haelt die FUESSE GEPLANT
-    und richtet die per IMU gemessene Neigung aktiv auf -> Oberkoerper-/Arm-
-    Stoerungen werden ohne Schritte abgefangen (man kann die Arme frei bewegen,
-    ohne dass er loslaeuft). Braucht nur IMU + Encoder.
-  * WALK (laufen): velocity-konditionierte Ganzkoerper-ONNX-Policy
-    (policies/g1_wholebody/policy.onnx, unitree_rl_mjlab G1 Velocity, Apache-2.0).
-    Laeuft omnidirektional, bremst sauber bis zum Stillstand.
+  * STAND (am Platz): modellbasierter Knoechel-/Hueft-PD (stand_balancer.py). Haelt
+    die FUESSE GEPLANT, richtet die per IMU gemessene Neigung aktiv auf und
+    schiebt das Becken so, dass der Schwerpunkt ueber der Fussmitte bleibt
+    (Schwerpunkt aus den Gelenkwinkeln, com_model.py) -> Arm-Bewegungen und Lasten
+    in den Haenden werden ohne Schritte abgefangen. Braucht IMU + Encoder.
+    Steht der Roboter in der Stand-Pose der Lauf-Policy (AGILE: breite Hocke).
+  * WALK (laufen): velocity-konditionierte ONNX-Lauf-Policy (walk_policy.py).
+    Default: policy:=g1_wholebody (unitree_rl_mjlab, braucht die Arme in der
+    Lauf-Pose -> arm_controller walk_park_arms:=true, setzt bringup_sim).
+    Alternativen (im Startmenue waehlbar): NVIDIA WBC-AGILE
+    "Velocity-G1-History-v0" (policies/agile_velocity_g1, Apache-2.0) und
+    "Velocity-Height-G1-History-v0" (policies/agile_velocity_height_g1). Sie
+    wurden mit staendig bewegten Armen trainiert -> die Arme bleiben beim Laufen
+    frei (arm_controller/Marker), keine Lauf-Pose noetig.
 
-WARUM HYBRID: Die Policy laeuft super und bremst sauber, aber unter DAUERHAFTER
-Arm-Bewegung im Stand driftet sie progressiv weg (headless: ~0.15 m nach 6 s,
-~0.9 m nach 13 s) — sie 'balanciert' Stoerungen per Schritt. Der PD haelt dagegen
-die Fuesse fest. Also: Policy fuers Laufen+Bremsen, PD fuers stationaere Stehen.
+WARUM HYBRID: Eine Lauf-Policy balanciert Stoerungen im Stand per Schritt und
+driftet unter dauernder Arm-Bewegung langsam weg. Der PD haelt dagegen die Fuesse
+fest. Also: Policy fuers Laufen+Bremsen, PD fuers stationaere Stehen. Nur wenn
+der PD es nicht mehr halten kann (Fuss hebt ab, Becken kippt stark; z.B. ein
+Stoss), faengt die Policy mit Schritten ab und gibt danach wieder an den PD.
 
-Uebergaenge (NUR per Nutzer-Button, KEIN automatisches Umschalten):
+Uebergaenge (per Nutzer-Button; automatisch nur das Abfangen, s.u.):
   * START BALANCING -> STAND (PD, Fuesse geplant, wirklich stationaer).
-  * START WALKING   -> WALK (Policy). Joystick=0 -> die Policy steht am Platz
-    (gait_phase=0); zum geplanten Stehen wechselt man bewusst zu BALANCING.
+    Aus HOLD/DAMP: die Bridge stellt den Roboter in die Stand-Pose der Policy
+    (loco_sim kommandiert sie im umschaltenden Befehl, die Bridge uebernimmt sie).
+    Aus WALK heraus: erst bremst die Policy mit cmd=0 aus, bis der Roboter ruhig
+    steht (settle_*), dann uebernimmt der PD und HAELT die vorgefundene Beinpose
+    (kein Hochziehen in die Standpose, das kippt mit Armen vorn; siehe
+    stand_balancer.py).
+  * START WALKING   -> WALK (Policy). Joystick=0 -> die Policy steht am Platz;
+    zum geplanten Stehen wechselt man bewusst zu BALANCING. Weil der PD in der
+    Stand-Pose der Policy steht, laeuft sie ohne Anlauf-Satz los.
+  * Kippen im STAND (rescue_*) -> Policy mit cmd = 0 faengt mit Schritten ab,
+    danach wie bei START BALANCING im Laufen zurueck in den PD.
   * Sturz erkannt (IMU-Neigung > Schwelle) -> DAMP (limp), kein Gezappel mehr.
 
 ARME: loco_sim regelt sie NICHT. Sie gehoeren komplett dem arm_controller
@@ -40,23 +57,18 @@ FSM (per Streamdeck-Topics); der Zustand wird auch der Bridge gemeldet (Weld):
   /g1pilot/emergency_stop(True)  : -> DAMP + Arme aus.
   /g1pilot/start(True)           : -> HOLD.
 
-Koerper-Aufteilung (passt zum Bridge-Merge): Arme (15..28) werden in BEIDEN Reglern
-nur als Fallback auf rt/lowcmd geschrieben und vom arm_controller via rt/arm_sdk
-(Weight-Blend) ueberschrieben -> man kann die Arme jederzeit frei fahren.
-
 Aufruf:  ros2 run g1pilot loco_sim --ros-args -p interface:=lo
 """
-import math
 import os
 import socket
 import threading
 import time
 
 import numpy as np
-import yaml
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from std_msgs.msg import Bool, Float32, String
 from geometry_msgs.msg import Twist
 from ament_index_python.packages import get_package_share_directory
 
@@ -66,6 +78,12 @@ from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.utils.crc import CRC
 
 from g1pilot.utils.common import init_dds
+from g1pilot.manipulation.waist_yaw import WAIST_STATE_TOPIC, STATE_STALE_S, parse_state
+from g1pilot.utils import push_charge
+from g1pilot.navigation.walk_policy import get_gravity_orientation, load_walk_policy
+from g1pilot.navigation.stand_balancer import (
+    BalancerParams, SettleGate, SettleParams, StandBalancer, TipDetector, TipParams,
+    LEG_IDX, LEG_KP, LEG_KD, LEG_STAND_POSE, WAIST_IDX, WAIST_KP, WAIST_KD, WAIST_TARGET)
 
 
 # FSM-Zustaende. Zustands-Code an die Bridge (rt/lowcmd motor_cmd[STATE_IDX].q):
@@ -81,30 +99,14 @@ LOCO_CODE = {HOLD: 0.0, STAND: 1.0, WALK: 1.0, DAMP: 2.0}
 
 NJ = 29            # G1: 29 Gelenke
 
-# ── PD-Stand: bewaehrte Bein-Config (1:1 aus dem fruehestabilen g1.yaml) ──
-# Die ARME (15..28) regelt loco_sim BEWUSST NICHT — sie gehoeren komplett dem
+# Regelschleifen-Ueberwachung: nur bei Auffaelligkeit loggen (G1_LOCO_DEBUG=1 = immer).
+LOCO_DEBUG = os.environ.get("G1_LOCO_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+LOOP_HZ_WARN_FRAC = 0.9        # Regeltakt < 90 % vom Soll -> melden
+LOOP_TILT_WARN_GZ = -0.9       # Schwerkraft-z im Rumpf > -0.9 (~26 Grad Neigung) -> melden
+LOOP_HEALTH_LOG_PERIOD_S = 30.0
+# Die ARME (15..28) regelt loco_sim BEWUSST NICHT -- sie gehoeren komplett dem
 # arm_controller (rt/arm_sdk, via rviz/Marker). loco_sim schreibt nur Beine (0..11)
 # und Taille (12..14). So koennen die Arme nie von loco_sim "teleportiert" werden.
-LEG_IDX = list(range(12))
-LEG_KP = np.array([100, 100, 100, 150, 40, 40, 100, 100, 100, 150, 40, 40], np.float32)
-LEG_KD = np.array([2, 2, 2, 4, 2, 2, 2, 2, 2, 4, 2, 2], np.float32)
-WAIST_IDX = [12, 13, 14]                           # Taille: yaw, roll, pitch
-WAIST_KP = np.array([300, 300, 300], np.float32)
-WAIST_KD = np.array([3, 3, 3], np.float32)
-WAIST_TARGET = np.zeros(3, np.float32)             # aufrecht
-# Indizes im 12er-Bein-Array (hip_pitch,hip_roll,hip_yaw,knee,ankle_pitch,ankle_roll):
-L_HIP_PITCH, L_HIP_ROLL, L_HIP_YAW, L_ANKLE_PITCH, L_ANKLE_ROLL = 0, 1, 2, 4, 5
-R_HIP_PITCH, R_HIP_ROLL, R_HIP_YAW, R_ANKLE_PITCH, R_ANKLE_ROLL = 6, 7, 8, 10, 11
-
-
-def get_gravity_orientation(quat):
-    """Projizierte Gravitation aus dem Pelvis-Quaternion [w,x,y,z] (aufrecht=[0,0,-1])."""
-    qw, qx, qy, qz = quat[0], quat[1], quat[2], quat[3]
-    g = np.zeros(3, dtype=np.float32)
-    g[0] = 2.0 * (-qz * qx + qw * qy)
-    g[1] = -2.0 * (qz * qy + qw * qx)
-    g[2] = 1.0 - 2.0 * (qw * qw + qz * qz)
-    return g
 
 
 class LocoSim(Node):
@@ -112,13 +114,33 @@ class LocoSim(Node):
         super().__init__("loco_sim")
 
         self.declare_parameter("interface", "lo")
+        # Lauf-Policy (Ordner unter share/g1pilot/policies), siehe Kopf-Docstring.
         self.declare_parameter("policy", "g1_wholebody")
         self.declare_parameter("damp_kd", 8.0)
-        # Phase-Stand-Schwelle (||cmd|| m/s) — wie im Training (mjlab phase() < 0.1).
-        self.declare_parameter("stand_eps", 0.1)
-        # WALK->STAND: nach so vielen Sekunden mit cmd=0 (Policy hat ausgebremst)
-        # uebernimmt der PD wieder.
+        # WALK->STAND (START BALANCING im Laufen): die Policy bremst mit cmd=0 aus;
+        # der PD uebernimmt fruehestens nach settle_s, wenn der Roboter settle_quiet_s
+        # lang ruhig ist (|Gyro| < settle_gyro_max, Bein-|dq| < settle_dq_max),
+        # spaetestens nach settle_timeout_s. Headless validiert (test_agile_walk_sim).
         self.declare_parameter("settle_s", 0.6)
+        self.declare_parameter("settle_quiet_s", 0.3)
+        self.declare_parameter("settle_gyro_max", 0.3)
+        self.declare_parameter("settle_dq_max", 0.5)
+        self.declare_parameter("settle_timeout_s", 3.0)
+        # Abfangen: Im STAND gibt loco_sim an die Policy (cmd=0, Schritte), wenn eine
+        # Sohle mehr als rescue_foot_tilt_deg kippt (Fuss hebt ab; normal < 2 Grad)
+        # oder das Becken mehr als rescue_tilt_max (|proj. Gravitation xy|) kippt,
+        # rescue_debounce_s lang. Danach wie START BALANCING im Laufen zurueck in den PD.
+        self.declare_parameter("rescue_enable", True)
+        self.declare_parameter("rescue_foot_tilt_deg", 6.0)
+        self.declare_parameter("rescue_tilt_max", 0.2)
+        self.declare_parameter("rescue_debounce_s", 0.04)
+        # Policy fuers Abfangen (policies/<name>). Leer -> wie in der deploy.yaml der
+        # Lauf-Policy (rescue_policy), sonst die Lauf-Policy selbst.
+        self.declare_parameter("rescue_policy", "")
+        # Sim-Modell fuer die Schwerpunkt-Fuehrung (com_model.py). Leer -> aus
+        # G1_INSPIRE_HANDS abgeleitet (/unitree_mujoco/... im g1pilot-sim-Container).
+        # Nicht ladbar -> Balancer ohne Schwerpunkt-Fuehrung (Warnung).
+        self.declare_parameter("robot_mjcf", "")
         # Sturz-Erkennung: aufrecht ist proj.grav z=-1; > fall_gz (Neigung ~>60 Grad)
         # ueber fall_debounce_s -> DAMP.
         self.declare_parameter("fall_gz", -0.5)
@@ -129,10 +151,12 @@ class LocoSim(Node):
         # den Boden). Hoehere kd haelt sie ruhig auf der Default-Standpose, OHNE sie
         # in einer ausgelenkten Schwungpose festzuhalten -> sauberer Balance-Eintritt.
         self.declare_parameter("hold_kd_scale", 6.0)
-        # WALK erst freigeben, wenn der arm_controller die Arme in die Lauf-Pose
-        # aufgeraeumt hat (/g1pilot/arms/walk_ready). Bis dahin bleibt loco_sim im
-        # stationaeren PD-STAND -> der Roboter laeuft nicht mit weit abstehenden
-        # Armen los. Fallback nach walk_arm_timeout_s, falls keine Meldung kommt.
+        # Nur fuer Policies, die die Arme in ihrer Trainings-Pose brauchen
+        # (needs_arm_pose, z.B. g1_wholebody): WALK erst freigeben, wenn der
+        # arm_controller die Arme in die Lauf-Pose aufgeraeumt hat
+        # (/g1pilot/arms/walk_ready). Bis dahin bleibt loco_sim im stationaeren
+        # PD-STAND. Fallback nach walk_arm_timeout_s, falls keine Meldung kommt.
+        # Die AGILE-Policy (Default) braucht das nicht -> sofort WALK.
         self.declare_parameter("walk_arm_wait", True)
         # Grosszuegig: aus der Sicheren Pose (Ellbogen hinten) brauchen die Arme mit
         # dem kartesischen Speedlimit (0.25 m/s) deutlich laenger als 4 s.
@@ -150,21 +174,27 @@ class LocoSim(Node):
         self.declare_parameter("bal_i_limit", 25.0)          # Anti-Windup [Nm]
         self.declare_parameter("bal_ankle_kp_pitch", 150.0)
         self.declare_parameter("bal_ankle_kd_pitch", 40.0)
-        self.declare_parameter("bal_ankle_kp_roll", 150.0)
-        self.declare_parameter("bal_ankle_kd_roll", 40.0)
+        # Roll halb so steif wie Pitch (in der breiten Hocke schaukelte 150/40 bzw.
+        # 200/40 den Inspire-Roboter seitlich auf, siehe stand_balancer.py).
+        self.declare_parameter("bal_ankle_kp_roll", 75.0)
+        self.declare_parameter("bal_ankle_kd_roll", 20.0)
         self.declare_parameter("bal_ankle_tau_limit", 50.0)
         self.declare_parameter("bal_hip_kp_pitch", 200.0)
         self.declare_parameter("bal_hip_kd_pitch", 40.0)
-        self.declare_parameter("bal_hip_kp_roll", 200.0)
-        self.declare_parameter("bal_hip_kd_roll", 40.0)
+        self.declare_parameter("bal_hip_kp_roll", 100.0)
+        self.declare_parameter("bal_hip_kd_roll", 20.0)
         self.declare_parameter("bal_hip_tau_limit", 80.0)
         self.declare_parameter("bal_yaw_kd", 30.0)
+        # Schwerpunkt-Fuehrung (stand_balancer.BalancerParams.com_*), com_tau_s 0 = aus.
+        self.declare_parameter("bal_com_target_m", 0.035)
+        self.declare_parameter("bal_com_tau_s", 0.2)
+        self.declare_parameter("bal_com_lead_s", 0.25)
+        self.declare_parameter("bal_com_limit", 0.2)
+        self.declare_parameter("bal_bias_tau_s", 2.0)
 
         interface = self.get_parameter("interface").get_parameter_value().string_value
         policy_name = self.get_parameter("policy").get_parameter_value().string_value
         self.damp_kd = float(self.get_parameter("damp_kd").value)
-        self.stand_eps = float(self.get_parameter("stand_eps").value)
-        self.settle_s = float(self.get_parameter("settle_s").value)
         self.fall_gz = float(self.get_parameter("fall_gz").value)
         self.fall_debounce_s = float(self.get_parameter("fall_debounce_s").value)
 
@@ -172,7 +202,9 @@ class LocoSim(Node):
             "1", "true", "yes", "on")
         self._state_seq = 0
 
-        self._load_policy(policy_name)
+        self._load_policy(policy_name,
+                          self.get_parameter("rescue_policy").get_parameter_value().string_value)
+        self._load_com_model(self.get_parameter("robot_mjcf").get_parameter_value().string_value)
 
         init_dds(interface, self.get_logger())
         self.low_state = None
@@ -201,32 +233,45 @@ class LocoSim(Node):
 
         # Laufzeit-Status. Start = HOLD.
         self.state = HOLD
-        self.action = np.zeros(NJ, dtype=np.float32)
         self.cmd = np.zeros(3, dtype=np.float32)
-        self.counter = 0
-        self._cmd_zero_since = None        # WALK->STAND-Timer
         self._fall_since = None            # Sturz-Debounce
-        self._bal_entering = False         # PD-Eintritts-Rampe
-        self._bal_q_start = None
-        self._bal_t0 = 0.0
-        self._bal_ramp_eff = 0.4           # effektive Rampendauer (am Eintritt bestimmt)
-        self._bal_integ = 0.0              # Integral-Trim Knoechel-Pitch [Nm]
+        self.balancer = StandBalancer(self.control_dt)
+        self.settle = SettleGate()         # WALK->STAND: erst ausbremsen lassen
+        self.tip = TipDetector()           # STAND: kippt er trotz PD? -> Policy faengt ab
+        self._rescue = False               # WALK nur zum Abfangen (cmd = 0, dann zurueck)
+        self._walk_after_rescue = False    # START WALKING waehrend des Abfangens
+        self._fresh_walk = False           # WALK aus HOLD/DAMP: erst Stand-Pose senden
         self._walk_pending = False         # WALK angefordert, warte auf Arme
         self._walk_pending_t0 = 0.0
         self._dbg_grav = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-        self._dbg_gyro = np.zeros(3, dtype=np.float32)
+        self._health_log_t = -1e9           # letzte Auffaelligkeits-Meldung der Regelschleife
 
         self.create_subscription(Bool, "/g1pilot/start_balancing", self._on_start_balancing, 10)
         self.create_subscription(Bool, "/g1pilot/start_walking", self._on_start_walking, 10)
         self.create_subscription(Bool, "/g1pilot/emergency_stop", self._on_emergency, 10)
         self.create_subscription(Bool, "/g1pilot/start", self._on_start, 10)
         self.create_subscription(Twist, "/g1pilot/loco_cmd_vel", self._on_cmd_vel, 10)
+        # PS4-Gehen (ps4_walk, L2-Deadman): Vorrang vor loco_cmd_vel, solange
+        # frisch -- die GUIs senden dort dauernd 0 und wuerden ihn sonst bremsen.
+        self._ps4_walk_t = -1e9
+        self.create_subscription(Twist, "/g1pilot/ps4/walk_cmd", self._on_ps4_walk, 10)
         self.create_subscription(Bool, "/g1pilot/arms/walk_ready", self._on_arms_walk_ready, 10)
+        # Hueftdrehung (arm_controller, waist_yaw.py): Taillen-Yaw-Sollwert im
+        # Stand (HOLD/STAND). Die Lauf-Policy fuehrt die Taille selbst; vor
+        # WALK dreht der arm_controller sie zur Mitte und meldet erst danach
+        # walk_ready. Ohne frischen Zustand -> langsam zurueck auf 0.
+        self._waist_yaw_des = 0.0
+        self._waist_yaw_t = -1e9
+        self._waist_yaw_cmd = None
+        self._waist_walk_ok = True
+        self.create_subscription(String, WAIST_STATE_TOPIC, self._on_waist_state, 10)
         self.arms_enabled_pub = self.create_publisher(Bool, "/g1pilot/arms/enabled", 1)
 
         self._push_port = int(os.environ.get("SIM_PUSH_PORT", "47900"))
         self._push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.create_subscription(Bool, "/g1pilot/push", self._on_push, 10)
+        # Aufladbarer Schubs: Ladegrad 0..1 beim Loslassen des PUSH-Buttons.
+        self.create_subscription(Float32, "/g1pilot/push_charge", self._on_push_charge, 10)
 
         # GRASP BOX: Streamdeck-Toggle -> UDP an die Sim (greifbare Test-Kugel an/aus).
         self._grasp_port = int(os.environ.get("SIM_GRASP_PORT", "47901"))
@@ -235,47 +280,70 @@ class LocoSim(Node):
 
         self._run_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._run_thread.start()
+
+        # Zustand (hold|stand|walk|damp, latched) fuer die Quittung des Sim-Auto-
+        # Starts der GUIs (teleoperation/sim_autostart.py): sie wiederholen START
+        # BALANCING, bis hier stand steht (z.B. weil rt/lowstate noch fehlte).
+        qos_state = QoSProfile(depth=1)
+        qos_state.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.state_pub = self.create_publisher(String, "/g1pilot/loco_state", qos_state)
+        self._state_sent = None
+        self.create_timer(0.2, self._publish_state)
+        self._publish_state()
         self.get_logger().info(
             f"loco_sim bereit (HOLD). policy='{policy_name}', control_dt={self.control_dt:.3f}s. "
             f"START BALANCING -> STAND (PD, Fuesse geplant). "
             f"START WALKING / loco_cmd_vel -> WALK (Policy).")
 
+    def _publish_state(self):
+        state = self.state
+        if state != self._state_sent:
+            self._state_sent = state
+            self.state_pub.publish(String(data=state))
+
     # ── Setup ────────────────────────────────────────────────────────────────
-    def _load_policy(self, policy_name):
-        import onnxruntime as ort
-        import onnx
+    def _load_policy(self, policy_name, rescue_name):
         share = get_package_share_directory("g1pilot")
         pdir = os.path.join(share, "policies", policy_name)
-        with open(os.path.join(pdir, "deploy.yaml"), "r") as f:
-            dep = yaml.safe_load(f)
-        self.kps = np.array(dep["stiffness"], dtype=np.float32)        # Policy-Gains (WALK)
-        self.kds = np.array(dep["damping"], dtype=np.float32)
-        self.default = np.array(dep["default_joint_pos"], dtype=np.float32)
-        self.action_scale = np.array(dep["actions"]["JointPositionAction"]["scale"],
-                                     dtype=np.float32)
-        self.control_dt = float(dep.get("step_dt", 0.02))
-        self.gait_period = float(dep["observations"]["gait_phase"]["params"].get("period", 0.6))
-        rng = dep["commands"]["base_velocity"]["ranges"]
-        self.cmd_x = (float(rng["lin_vel_x"][0]), float(rng["lin_vel_x"][1]))
-        self.cmd_y = (float(rng["lin_vel_y"][0]), float(rng["lin_vel_y"][1]))
-        self.cmd_yaw = (float(rng["ang_vel_z"][0]), float(rng["ang_vel_z"][1]))
-        assert len(self.kps) == NJ and len(self.default) == NJ, "deploy.yaml: erwarte 29 Gelenke"
-
-        policy_path = os.path.join(pdir, dep.get("policy_file", "policy.onnx"))
-        meta = {p.key: p.value for p in onnx.load(policy_path).metadata_props}
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = 1
-        so.inter_op_num_threads = 1
-        self.sess = ort.InferenceSession(policy_path, sess_options=so,
-                                         providers=["CPUExecutionProvider"])
-        self.in_name = self.sess.get_inputs()[0].name
-        self.num_obs = int(self.sess.get_inputs()[0].shape[-1])
-        assert self.num_obs == 98, f"erwarte 98 Obs, ONNX meldet {self.num_obs}"
-        self.obs = np.zeros((1, self.num_obs), dtype=np.float32)
-        for _ in range(3):
-            self.sess.run(None, {self.in_name: self.obs})
+        self.walk_policy = load_walk_policy(pdir)
+        self.control_dt = self.walk_policy.step_dt
+        # Abfang-Policy: eigene Instanz nur, wenn sie sich von der Lauf-Policy
+        # unterscheidet (beide im selben Regeltakt).
+        rescue_name = rescue_name or self.walk_policy.rescue_policy_name
+        if not rescue_name or rescue_name == policy_name:
+            self.rescue_policy = self.walk_policy
+        else:
+            self.rescue_policy = load_walk_policy(os.path.join(share, "policies", rescue_name))
+            if abs(self.rescue_policy.step_dt - self.control_dt) > 1e-9:
+                raise ValueError(f"rescue_policy '{rescue_name}' hat step_dt "
+                                 f"{self.rescue_policy.step_dt}, Lauf-Policy {self.control_dt}")
+            self.get_logger().info(f"Abfang-Policy: {self.rescue_policy.policy_path}")
+        # Stand-Pose des PD aus HOLD: die der Policy (AGILE: breite Hocke), sonst
+        # die gerade Standpose. Dort startet die Policy ohne Anlauf-Satz.
+        sp = self.walk_policy.stand_leg_pose
+        self.stand_pose = LEG_STAND_POSE.copy() if sp is None else sp.copy()
         self.get_logger().info(
-            f"Policy geladen: {policy_path} (run='{meta.get('run_path','?')}')")
+            f"Lauf-Policy geladen: {self.walk_policy.policy_path} "
+            f"({type(self.walk_policy).__name__}, Arm-Pose noetig: "
+            f"{self.walk_policy.needs_arm_pose}, Stand-Pose: "
+            f"{'Policy' if sp is not None else 'gerade'})")
+
+    def _load_com_model(self, path):
+        if not path:
+            inspire = os.environ.get("G1_INSPIRE_HANDS", "0").strip().lower() in (
+                "1", "true", "yes", "on")
+            path = os.path.join("/unitree_mujoco/unitree_robots/g1",
+                                "g1_29dof_inspire_ftp.xml" if inspire else "g1_29dof.xml")
+        self.com_model = None
+        try:
+            from g1pilot.navigation.com_model import ComModel
+            self.com_model = ComModel(path)
+            self.get_logger().info(
+                f"Schwerpunkt-Modell: {path} ({self.com_model.mass:.1f} kg).")
+        except Exception as e:
+            self.get_logger().warn(
+                f"Schwerpunkt-Modell nicht geladen ({path}: {e}). Stand-Balancer ohne "
+                f"Schwerpunkt-Fuehrung: Arm-Bewegungen/Lasten koennen ihn kippen.")
 
     # ── DDS / ROS Callbacks ──────────────────────────────────────────────────
     def _on_lowstate(self, msg: LowState_):
@@ -284,7 +352,9 @@ class LocoSim(Node):
             self.mode_machine = int(getattr(msg, "mode_machine", 0))
             self._state_seq += 1
 
-    def _enter_stand(self, reason):
+    def _enter_stand(self, reason, hold_pose=False):
+        """hold_pose=False: aus HOLD/DAMP, die Bridge stellt den Roboter in
+        self.stand_pose. hold_pose=True: aus WALK, die vorgefundene Pose halten."""
         if self.low_state is None:
             self.get_logger().warn(f"Kann nicht STAND ({reason}): keine rt/lowstate.")
             return
@@ -299,50 +369,131 @@ class LocoSim(Node):
             return
         with self._lock:
             self.cmd = np.zeros(3, dtype=np.float32)
-        self._bal_entering = True           # Rampe: aktuelle Beinpose -> default
-        self._bal_q_start = None
-        self._bal_integ = 0.0               # Trim neu lernen (Pose/Last kann sich geaendert haben)
-        self._cmd_zero_since = None
+        # Aus HOLD/DAMP: Stand-Pose kommandieren (die Bridge stellt den Roboter beim
+        # Wechsel genau dorthin). Aus WALK (hold_pose): die Pose halten, in der die
+        # Policy den Roboter abgestellt hat. Trim/Schwerpunkt neu lernen.
+        self.balancer.enter(None if hold_pose else self.stand_pose)
+        self.settle.cancel()
+        self.tip.reset()
+        self._rescue = self._walk_after_rescue = False
         self._fall_since = None
         self._walk_pending = False          # ein STAND bricht eine WALK-Anforderung ab
         self.state = STAND
-        self.get_logger().info(f"{reason} -> STAND (PD, Fuesse geplant).")
+        self.get_logger().info(f"{reason} -> STAND (PD, Fuesse geplant"
+                               + (", haelt die Lauf-Endpose)." if hold_pose else ")."))
 
     def _enter_walk(self, reason):
         if self.low_state is None:
             self.get_logger().warn(f"Kann nicht WALK ({reason}): keine rt/lowstate.")
             return
-        self.counter = 0
-        self.action[:] = 0.0
-        self._cmd_zero_since = None
+        if self.state == WALK:
+            if self._rescue and self.rescue_policy is not self.walk_policy:
+                # Abfangen laeuft mit einer anderen Policy: nicht mitten im Fangschritt
+                # wechseln. Danach direkt weiter nach WALK statt in den PD.
+                self._walk_after_rescue = True
+                self.get_logger().info(f"{reason}: Abfangen laeuft, danach WALK.")
+                return
+            # Laeuft schon: Policy-History NICHT zuruecksetzen (waere ein Ruck), nur
+            # eine evtl. laufende STAND-Uebergabe abbrechen.
+            if self.settle.active:
+                self.settle.cancel()
+                self.get_logger().info(f"{reason}: STAND-Uebergabe abgebrochen, laufe weiter.")
+            self._rescue = False
+            self._walk_pending = False
+            return
+        # Aus HOLD/DAMP stellt die Bridge den Roboter beim Wechsel neu auf: erst
+        # einen Takt die Stand-Pose kommandieren (_send_policy), damit sie genau
+        # dort aufstellt, wo die Policy ruhig steht.
+        self._fresh_walk = self.state in (HOLD, DAMP)
+        self.walk_policy.reset()
+        self.settle.cancel()
+        self._rescue = False
+        self._walk_after_rescue = False
         self._fall_since = None
         self._walk_pending = False
         self.state = WALK
         self.get_logger().info(f"{reason} -> WALK (Policy).")
 
+    def _enter_rescue(self):
+        """STAND -> Policy faengt mit Schritten ab (cmd = 0), danach zurueck in den
+        PD ueber die SettleGate (wie START BALANCING im Laufen)."""
+        self.rescue_policy.reset()
+        self._rescue = True
+        self._walk_after_rescue = False
+        self._fresh_walk = False
+        self._fall_since = None
+        self.state = WALK
+        self.settle.start(time.perf_counter())
+        self.get_logger().warn(
+            "STAND: Roboter kippt (Fuss hebt ab) -> Policy faengt mit Schritten ab, "
+            "danach wieder PD.")
+
     def _on_start_balancing(self, msg: Bool):
-        if msg.data:
-            self._enter_stand("START BALANCING")
+        if not msg.data:
+            return
+        if self.state == WALK:
+            # Nicht direkt umschalten: erst ausbremsen lassen (_send_policy), der PD
+            # uebernimmt, sobald der Roboter ruhig steht.
+            if not self.settle.active:
+                self.settle.start(time.perf_counter())
+                self.get_logger().info(
+                    "START BALANCING -> Policy bremst aus, PD uebernimmt, sobald der Roboter ruhig steht ...")
+            return
+        self._enter_stand("START BALANCING")
 
     def _on_start_walking(self, msg: Bool):
         if not msg.data:
             return
-        # WALK angefordert: erst die Arme aufraeumen lassen (der arm_controller faehrt
-        # sie auf dieselbe start_walking-Nachricht hin in die Lauf-Pose). Solange im
-        # stationaeren PD-STAND bleiben -> der Roboter laeuft nicht mit abstehenden
-        # Armen los. Sobald /g1pilot/arms/walk_ready True ist (oder der Timeout greift),
-        # geht es nach WALK. Abschaltbar via walk_arm_wait=false.
-        if not bool(self.get_parameter("walk_arm_wait").value):
+        # Braucht die Policy die Arme in ihrer Trainings-Pose (Legacy g1_wholebody),
+        # erst die Arme aufraeumen lassen (der arm_controller faehrt sie auf dieselbe
+        # start_walking-Nachricht hin in die Lauf-Pose). Solange im stationaeren
+        # PD-STAND bleiben. Sobald /g1pilot/arms/walk_ready True ist (oder der
+        # Timeout greift), geht es nach WALK. Die AGILE-Policy laeuft sofort los.
+        # Huefte gedreht (Hueftdrehung im Stand): auch die AGILE-Policy wartet,
+        # bis der arm_controller die Taille zur Mitte gedreht hat (walk_ready).
+        waist_wait = self._waist_yaw_fresh() and not self._waist_walk_ok
+        if not (self.walk_policy.needs_arm_pose
+                and bool(self.get_parameter("walk_arm_wait").value)) and not waist_wait:
             self._enter_walk("START WALKING")
             return
         # Stationaer stehen bleiben (Fuesse geplant), waehrend die Arme aufraeumen.
         # _enter_stand zuerst (loescht u.a. ein altes pending-Flag), DANACH scharf
         # schalten, damit walk_ready/Timeout den Wechsel nach WALK ausloesen.
         if self.state != STAND:
-            self._enter_stand("START WALKING (warte auf Arme)")
+            self._enter_stand("START WALKING (warte auf Arme)", hold_pose=(self.state == WALK))
         self._walk_pending = True
         self._walk_pending_t0 = time.perf_counter()
         self.get_logger().info("START WALKING -> warte, bis die Arme aufgeraeumt sind ...")
+
+    WAIST_YAW_SLEW = 0.5   # rad/s, Sicherheitsrampe (der Sollwert rampt schon)
+
+    def _on_waist_state(self, msg: String):
+        st = parse_state(msg.data)
+        if not st or not st.get("sim") or st.get("target_rad") is None:
+            return
+        try:
+            self._waist_yaw_des = float(st["target_rad"])
+        except (TypeError, ValueError):
+            return
+        self._waist_walk_ok = bool(st.get("walk_ok", True))
+        self._waist_yaw_t = time.monotonic()
+
+    def _waist_yaw_fresh(self):
+        return time.monotonic() - self._waist_yaw_t <= STATE_STALE_S
+
+    def _waist_targets(self, base, q_now):
+        """Taillen-Sollwerte (yaw, roll, pitch) mit dem Hueft-Yaw: base = Ziel
+        des Stands (Balancer/WAIST_TARGET), q_now = gemessener Yaw (Start)."""
+        des = self._waist_yaw_des if self._waist_yaw_fresh() else 0.0
+        cmd = self._waist_yaw_cmd
+        if cmd is None:
+            cmd = float(q_now)
+        step = self.WAIST_YAW_SLEW * self.control_dt
+        cmd += max(-step, min(step, des - cmd))
+        self._waist_yaw_cmd = cmd
+        out = np.array(base, dtype=np.float32).copy()
+        out[0] = cmd
+        return out
 
     def _on_arms_walk_ready(self, msg: Bool):
         if msg.data and self._walk_pending:
@@ -352,6 +503,8 @@ class LocoSim(Node):
         if msg.data:
             self.state = DAMP
             self._walk_pending = False
+            self._rescue = self._walk_after_rescue = False
+            self.settle.cancel()
             self.arms_enabled_pub.publish(Bool(data=False))
             self.get_logger().warn("EMERGENCY STOP -> DAMP + Arme aus.")
 
@@ -359,6 +512,8 @@ class LocoSim(Node):
         if msg.data:
             self.state = HOLD
             self._walk_pending = False
+            self._rescue = self._walk_after_rescue = False
+            self.settle.cancel()
             self.get_logger().info("START -> Standby (HOLD).")
 
     def _on_push(self, msg: Bool):
@@ -367,6 +522,19 @@ class LocoSim(Node):
         try:
             self._push_sock.sendto(b"push", ("127.0.0.1", self._push_port))
             self.get_logger().info("PUSH -> Stoer-Impuls an die Sim.")
+        except OSError as e:
+            self.get_logger().warn(f"PUSH nicht gesendet: {e}")
+
+    def _on_push_charge(self, msg: Float32):
+        """Ladegrad 0..1 (Button gehalten) -> Kraft in N -> UDP an die Sim.
+        0 = kurzer Klick = bisheriger Schubs (Payload 'push' -> Kraft aus config)."""
+        level = min(1.0, max(0.0, float(msg.data)))
+        payload = b"push" if level <= 0.0 else f"{push_charge.force_for_level(level):.1f}".encode()
+        try:
+            self._push_sock.sendto(payload, ("127.0.0.1", self._push_port))
+            self.get_logger().info(
+                f"PUSH -> Stoer-Impuls an die Sim (Ladegrad {level*100:.0f} %, "
+                f"{push_charge.force_for_level(level):.0f} N).")
         except OSError as e:
             self.get_logger().warn(f"PUSH nicht gesendet: {e}")
 
@@ -379,17 +547,21 @@ class LocoSim(Node):
         except OSError as e:
             self.get_logger().warn(f"GRASP BOX nicht gesendet: {e}")
 
+    def _on_ps4_walk(self, msg: Twist):
+        self._ps4_walk_t = time.monotonic()
+        self._apply_cmd_vel(msg)
+
     def _on_cmd_vel(self, msg: Twist):
+        if time.monotonic() - self._ps4_walk_t < 0.3:
+            return
+        self._apply_cmd_vel(msg)
+
+    def _apply_cmd_vel(self, msg: Twist):
         if self.state not in (STAND, WALK):
             return
-        nx = max(-1.0, min(1.0, msg.linear.x))
-        ny = max(-1.0, min(1.0, msg.linear.y))
-        nz = max(-1.0, min(1.0, msg.angular.z))
-        vx = nx * (self.cmd_x[1] if nx >= 0 else -self.cmd_x[0])
-        vy = ny * (self.cmd_y[1] if ny >= 0 else -self.cmd_y[0])
-        vyaw = nz * (self.cmd_yaw[1] if nz >= 0 else -self.cmd_yaw[0])
+        cmd = self.walk_policy.scale_command(msg.linear.x, msg.linear.y, msg.angular.z)
         with self._lock:
-            self.cmd = np.array([vx, vy, vyaw], dtype=np.float32)
+            self.cmd = cmd
         # KEIN Auto-Umschalten: im STAND (PD) ignoriert der Roboter den Joystick und
         # bleibt wirklich stationaer. Laufen startet nur per START WALKING-Button.
 
@@ -403,6 +575,29 @@ class LocoSim(Node):
         else:
             self._fall_since = None
         return False
+
+    def _check_loop_health(self, n, span):
+        """Alle ~100 Takte: Regeltakt und Neigung pruefen. Gemeldet wird nur bei
+        Auffaelligkeit (max. alle 30 s); die volle Statuszeile gibt es nur mit
+        G1_LOCO_DEBUG=1."""
+        hz = n / span if span > 0 else 0.0
+        eff = (1.0 / self.control_dt) if self.lockstep else hz
+        g = self._dbg_grav
+        soll = 1.0 / self.control_dt
+        problems = []
+        if eff < LOOP_HZ_WARN_FRAC * soll:
+            problems.append(f"Regeltakt zu langsam: {eff:.1f} Hz (soll {soll:.0f})")
+        if float(g[2]) > LOOP_TILT_WARN_GZ:
+            problems.append(f"Neigung gross: grav=[{g[0]:+.2f} {g[1]:+.2f} {g[2]:+.2f}]")
+        now = time.perf_counter()
+        if problems and now - self._health_log_t >= LOOP_HEALTH_LOG_PERIOD_S:
+            self._health_log_t = now
+            self.get_logger().warn(f"[{self.state}] " + "; ".join(problems))
+        elif LOCO_DEBUG:
+            self.get_logger().info(
+                f"[{self.state}] eff={eff:.1f}Hz (soll {soll:.0f}) "
+                f"grav=[{g[0]:+.2f} {g[1]:+.2f} {g[2]:+.2f}] "
+                f"cmd=[{self.cmd[0]:+.2f} {self.cmd[1]:+.2f} {self.cmd[2]:+.2f}]")
 
     # ── Regelschleife ────────────────────────────────────────────────────────
     def _control_loop(self):
@@ -438,15 +633,7 @@ class LocoSim(Node):
             if self.state in (STAND, WALK):
                 diag_n += 1
                 if diag_n >= 100:
-                    span = time.perf_counter() - diag_t0
-                    hz = diag_n / span if span > 0 else 0.0
-                    eff = (1.0 / self.control_dt) if self.lockstep else hz
-                    g = self._dbg_grav
-                    self.get_logger().info(
-                        f"[{self.state}] eff={eff:.1f}Hz (soll 50) "
-                        f"grav=[{g[0]:+.2f} {g[1]:+.2f} {g[2]:+.2f}] "
-                        f"cmd=[{self.cmd[0]:+.2f} {self.cmd[1]:+.2f} {self.cmd[2]:+.2f}]"
-                        + ("  <-- ZU LANGSAM!" if eff < 45 else ""))
+                    self._check_loop_health(diag_n, time.perf_counter() - diag_t0)
                     diag_n = 0
                     diag_t0 = time.perf_counter()
             else:
@@ -471,18 +658,16 @@ class LocoSim(Node):
         self.cmd_msg.crc = self.crc.Crc(self.cmd_msg)
         self.lowcmd_pub.Write(self.cmd_msg)
 
-    def _hold_waist(self, waist_scale=1.0):
-        """Taille (12..14) aufrecht halten. waist_scale steift sie zusaetzlich an,
-        damit der Oberkoerper nicht nach vorn flopt. Die ARME bleiben unberuehrt
-        (arm_controller-Domaene)."""
-        for k, idx in enumerate(WAIST_IDX):
-            mc = self.cmd_msg.motor_cmd[idx]
+    def _set_motors(self, idx, q, kp, kd, tau=None):
+        """PD-Sollwerte fuer die Motoren idx in die naechste rt/lowcmd schreiben."""
+        for k, i in enumerate(idx):
+            mc = self.cmd_msg.motor_cmd[int(i)]
             mc.mode = 1
-            mc.q = float(WAIST_TARGET[k])
+            mc.q = float(q[k])
             mc.dq = 0.0
-            mc.tau = 0.0
-            mc.kp = float(WAIST_KP[k]) * waist_scale
-            mc.kd = float(WAIST_KD[k]) * math.sqrt(waist_scale)
+            mc.tau = float(tau[k]) if tau is not None else 0.0
+            mc.kp = float(kp[k])
+            mc.kd = float(kd[k])
 
     def _send_hold(self):
         # Steifer Stand: Beine auf Default-Standpose, Taille gehalten. Arme: frei.
@@ -491,15 +676,9 @@ class LocoSim(Node):
         # Pose sitzen. Ziel bleibt bewusst die natuerliche Standpose (default), nicht
         # die zufaellige Auslenkung -> der Balance-Eintritt startet aus der Ruhe.
         kd_scale = float(self.get_parameter("hold_kd_scale").value)
-        for k, idx in enumerate(LEG_IDX):
-            mc = self.cmd_msg.motor_cmd[idx]
-            mc.mode = 1
-            mc.q = float(self.default[idx])
-            mc.dq = 0.0
-            mc.tau = 0.0
-            mc.kp = float(LEG_KP[k])
-            mc.kd = float(LEG_KD[k]) * kd_scale
-        self._hold_waist()
+        self._set_motors(LEG_IDX, LEG_STAND_POSE, LEG_KP, LEG_KD * kd_scale)
+        yaw_now = self.low_state.motor_state[int(WAIST_IDX[0])].q if self.low_state else 0.0
+        self._set_motors(WAIST_IDX, self._waist_targets(WAIST_TARGET, yaw_now), WAIST_KP, WAIST_KD)
         self._write()
 
     def _send_damp(self):
@@ -512,20 +691,44 @@ class LocoSim(Node):
             mc.kd = self.damp_kd
         self._write()
 
-    def _send_balance_pd(self):
-        """Modellbasierter Knoechel-/Hueft-Balancer (Fuesse geplant, stationaer).
+    def _balancer_params(self):
+        """Aktuelle Balancer-Gains aus den (live tunebaren) ROS-Parametern."""
+        def g(name):
+            return float(self.get_parameter(name).value)
+        return BalancerParams(
+            kp_scale=g("bal_kp_scale"), ramp_s=g("bal_ramp_s"),
+            ki_pitch=g("bal_ki_pitch"), i_limit=g("bal_i_limit"),
+            ankle_kp_pitch=g("bal_ankle_kp_pitch"), ankle_kd_pitch=g("bal_ankle_kd_pitch"),
+            ankle_kp_roll=g("bal_ankle_kp_roll"), ankle_kd_roll=g("bal_ankle_kd_roll"),
+            ankle_tau_limit=g("bal_ankle_tau_limit"),
+            hip_kp_pitch=g("bal_hip_kp_pitch"), hip_kd_pitch=g("bal_hip_kd_pitch"),
+            hip_kp_roll=g("bal_hip_kp_roll"), hip_kd_roll=g("bal_hip_kd_roll"),
+            hip_tau_limit=g("bal_hip_tau_limit"), yaw_kd=g("bal_yaw_kd"),
+            com_target_m=g("bal_com_target_m"), com_tau_s=g("bal_com_tau_s"),
+            com_lead_s=g("bal_com_lead_s"), com_limit=g("bal_com_limit"),
+            bias_tau_s=g("bal_bias_tau_s"),
+            mass_kg=self.com_model.mass if self.com_model is not None else 35.0)
 
-        Posture-PD auf default_angles (Steifigkeit x bal_kp_scale) + Feedforward-
-        DREHMOMENT [Nm] auf Knoechel (primaer) und Huefte (sekundaer), das die per
-        IMU gemessene Neigung aktiv aufrichtet. Braucht nur IMU + Encoder ->
-        station-keeping per Konstruktion, faengt Oberkoerper-/Arm-Stoerungen ohne
-        Schritte. Die Bridge addiert tau zum Posture-PD."""
+    def _tip_params(self):
+        def g(name):
+            return float(self.get_parameter(name).value)
+        return TipParams(foot_tilt_deg=g("rescue_foot_tilt_deg"),
+                         tilt_max=g("rescue_tilt_max"), debounce_s=g("rescue_debounce_s"))
+
+    def _settle_params(self):
+        def g(name):
+            return float(self.get_parameter(name).value)
+        return SettleParams(min_s=g("settle_s"), quiet_s=g("settle_quiet_s"),
+                            gyro_max=g("settle_gyro_max"), dq_max=g("settle_dq_max"),
+                            timeout_s=g("settle_timeout_s"))
+
+    def _send_balance_pd(self):
+        """Modellbasierter Knoechel-/Hueft-Balancer (Fuesse geplant, stationaer),
+        Regelgesetz in stand_balancer.StandBalancer."""
         ls = self.low_state
-        quat = ls.imu_state.quaternion
         gyro = np.array(ls.imu_state.gyroscope, dtype=np.float32)
-        g = get_gravity_orientation(quat)
+        g = get_gravity_orientation(ls.imu_state.quaternion)
         self._dbg_grav = g.copy()
-        self._dbg_gyro = gyro.copy()
 
         if self._fallen(g):
             self.state = DAMP
@@ -533,137 +736,87 @@ class LocoSim(Node):
             self.get_logger().warn("STURZ erkannt (Stand) -> DAMP + Arme aus.")
             return self._send_damp()
 
-        pitch_err, roll_err = float(g[0]), float(g[1])
-        pitch_rate, roll_rate, yaw_rate = float(gyro[1]), float(gyro[0]), float(gyro[2])
-        akp_p = self.get_parameter("bal_ankle_kp_pitch").value
-        akd_p = self.get_parameter("bal_ankle_kd_pitch").value
-        akp_r = self.get_parameter("bal_ankle_kp_roll").value
-        akd_r = self.get_parameter("bal_ankle_kd_roll").value
-        hkp_p = self.get_parameter("bal_hip_kp_pitch").value
-        hkd_p = self.get_parameter("bal_hip_kd_pitch").value
-        hkp_r = self.get_parameter("bal_hip_kp_roll").value
-        hkd_r = self.get_parameter("bal_hip_kd_roll").value
-        a_lim = float(self.get_parameter("bal_ankle_tau_limit").value)
-        h_lim = float(self.get_parameter("bal_hip_tau_limit").value)
-        yaw_kd = float(self.get_parameter("bal_yaw_kd").value)
-        kp_scale = float(self.get_parameter("bal_kp_scale").value)
+        now = time.perf_counter()
+        q = np.array([ls.motor_state[i].q for i in range(NJ)], dtype=np.float32)
+        dq_legs = np.array([ls.motor_state[i].dq for i in LEG_IDX], dtype=np.float32)
+        quat = np.array(ls.imu_state.quaternion, dtype=np.float64)
 
-        # Sanfter Eintritt: aktuelle Beinpose -> default ueber bal_ramp_s blenden,
-        # damit der steife PD die Beine nicht aus der (Lauf-)Stellung reisst.
-        # WICHTIG: Die Rampe nur fahren, wenn die Beine wirklich WEIT von der
-        # Standpose weg sind (Eintritt aus WALK). Beim Start aus HOLD hat die
-        # Bridge den Roboter gerade frisch in die Standpose gestellt — waehrend
-        # einer 0.4-s-Weich-Phase kippte der (durch die Inspire-Haende kopf-
-        # lastigere) Roboter dann unaufholbar nach vorn. Headless validiert:
-        # ramp 0.4 s -> Sturz bei ~2 s; ramp 0.1 s -> steht (|gx|max=0.04).
-        if self._bal_entering:
-            self._bal_q_start = np.array([ls.motor_state[i].q for i in LEG_IDX], dtype=np.float32)
-            self._bal_t0 = time.perf_counter()
-            self._bal_entering = False
-            leg_err = float(np.max(np.abs(self._bal_q_start - self.default[:12])))
-            self._bal_ramp_eff = float(self.get_parameter("bal_ramp_s").value) \
-                if leg_err > 0.15 else 0.1
-        ramp_s = self._bal_ramp_eff
-        if self._bal_q_start is not None and ramp_s > 1e-3:
-            ramp = max(0.0, min(1.0, (time.perf_counter() - self._bal_t0) / ramp_s))
-        else:
-            ramp = 1.0
-        kp_scale_eff = 1.0 + (kp_scale - 1.0) * ramp
-        q_start = self._bal_q_start if self._bal_q_start is not None else self.default[:12]
+        # Kann der PD das noch halten? Hebt ein Fuss ab, faengt die Policy ab.
+        if (bool(self.get_parameter("rescue_enable").value)
+                and self.tip.update(now, quat, q[LEG_IDX], g, self._tip_params())):
+            self._enter_rescue()
+            return self._send_policy()
 
-        def clamp(x, lim):
-            return max(-lim, min(lim, x))
-
-        # Integral-Trim: langsam die STATISCHE Neigung wegintegrieren (CoM-Versatz
-        # durch Haende/Payload). Nur solange der Roboter nicht am Kippen ist
-        # (|gx| < 0.4), mit Anti-Windup-Klemme.
-        ki = float(self.get_parameter("bal_ki_pitch").value)
-        i_lim = float(self.get_parameter("bal_i_limit").value)
-        if ki > 0.0 and abs(pitch_err) < 0.4:
-            self._bal_integ = clamp(self._bal_integ + ki * pitch_err * self.control_dt, i_lim)
-
-        # Feedforward [Nm]. Vorzeichen aus der Gelenk-Kinematik (validiert):
-        t_ankle_pitch = clamp(akp_p * pitch_err + akd_p * pitch_rate + self._bal_integ, a_lim)
-        t_ankle_roll = clamp(-(akp_r * roll_err + akd_r * roll_rate), a_lim)
-        t_hip_pitch = clamp(hkp_p * pitch_err + hkd_p * pitch_rate, h_lim)
-        t_hip_roll = clamp(-(hkp_r * roll_err + hkd_r * roll_rate), h_lim)
-        t_hip_yaw = clamp(-yaw_kd * yaw_rate, 40.0)
-
-        tau = np.zeros(12, dtype=np.float32)
-        tau[L_ANKLE_PITCH] = tau[R_ANKLE_PITCH] = t_ankle_pitch
-        tau[L_ANKLE_ROLL] = tau[R_ANKLE_ROLL] = t_ankle_roll
-        tau[L_HIP_PITCH] = tau[R_HIP_PITCH] = t_hip_pitch
-        tau[L_HIP_ROLL] = tau[R_HIP_ROLL] = t_hip_roll
-        tau[L_HIP_YAW] = tau[R_HIP_YAW] = t_hip_yaw
-        tau *= ramp
-        self.action = np.zeros(NJ, dtype=np.float32)
-        self.action[:12] = tau
-
-        kd_scale = math.sqrt(max(kp_scale_eff, 1e-6))
-        for k, idx in enumerate(LEG_IDX):
-            mc = self.cmd_msg.motor_cmd[idx]
-            mc.mode = 1
-            mc.q = float(q_start[k] * (1.0 - ramp) + self.default[idx] * ramp)
-            mc.dq = 0.0
-            mc.tau = float(tau[k])
-            mc.kp = float(LEG_KP[k]) * kp_scale_eff
-            mc.kd = float(LEG_KD[k]) * kd_scale
-        self._hold_waist(waist_scale=kp_scale_eff)
+        com_x = (float(self.com_model.com_in_foot(q)[0])
+                 if self.com_model is not None else None)
+        c = self.balancer.step(q[LEG_IDX], dq_legs, g, gyro, now,
+                               self._balancer_params(), com_x)
+        self._set_motors(LEG_IDX, c.leg_q, c.leg_kp, c.leg_kd, tau=c.leg_tau)
+        self._set_motors(WAIST_IDX, self._waist_targets(c.waist_q, q[int(WAIST_IDX[0])]),
+                         c.waist_kp, c.waist_kd)
         self._write()
 
-    def _build_obs(self):
+    def _send_policy(self):
         ls = self.low_state
         q = np.array([ls.motor_state[i].q for i in range(NJ)], dtype=np.float32)
         dq = np.array([ls.motor_state[i].dq for i in range(NJ)], dtype=np.float32)
-        quat = ls.imu_state.quaternion
         gyro = np.array(ls.imu_state.gyroscope, dtype=np.float32)
-        gravity = get_gravity_orientation(quat)
+        gravity = get_gravity_orientation(ls.imu_state.quaternion)
         self._dbg_grav = gravity.copy()
-        self._dbg_gyro = gyro.copy()
         with self._lock:
             cmd = self.cmd.copy()
-        if float(np.linalg.norm(cmd)) < self.stand_eps:
-            sin_p = cos_p = 0.0
-        else:
-            phase = (self.counter * self.control_dt % self.gait_period) / self.gait_period
-            sin_p = math.sin(2.0 * math.pi * phase)
-            cos_p = math.cos(2.0 * math.pi * phase)
-        o = self.obs[0]
-        o[0:3] = gyro
-        o[3:6] = gravity
-        o[6:9] = cmd
-        o[9] = sin_p
-        o[10] = cos_p
-        o[11:11 + NJ] = q - self.default
-        o[11 + NJ:11 + 2 * NJ] = dq
-        o[11 + 2 * NJ:11 + 3 * NJ] = self.action
-        return self.obs, gravity, cmd
-
-    def _send_policy(self):
-        self.counter += 1
-        obs, gravity, cmd = self._build_obs()
 
         if self._fallen(gravity):
             self.state = DAMP
+            self.settle.cancel()
+            self._rescue = self._walk_after_rescue = False
             self.arms_enabled_pub.publish(Bool(data=False))
             self.get_logger().warn("STURZ erkannt (Walk) -> DAMP + Arme aus.")
             return self._send_damp()
 
-        # KEIN Auto-Umschalten mehr: bei cmd=0 STEHT die Policy einfach am Platz
-        # (gait_phase=0). Zu wirklich stationaer (Fuesse geplant) wechselt nur der
-        # Nutzer per START BALANCING.
-        self.action = self.sess.run(None, {self.in_name: obs})[0][0].astype(np.float32)
-        target = self.default + self.action * self.action_scale
-        # NUR Beine (0..11) + Taille (12..14) aktuieren. Arme (15..28) bleiben dem
-        # arm_controller (rt/arm_sdk) ueberlassen -> kein Arm-Teleport beim Laufen.
-        for i in range(15):
-            mc = self.cmd_msg.motor_cmd[i]
-            mc.mode = 1
-            mc.q = float(target[i])
-            mc.dq = 0.0
-            mc.tau = 0.0
-            mc.kp = float(self.kps[i])
-            mc.kd = float(self.kds[i])
+        if self._fresh_walk:
+            # Erster Takt aus HOLD/DAMP: Stand-Pose kommandieren. Die Bridge stellt
+            # den Roboter beim Wechsel in genau diese Pose; ab dem naechsten Takt
+            # laeuft die Policy (History frisch aus dem aufgestellten Zustand).
+            self._fresh_walk = False
+            self.walk_policy.reset()
+            self._set_motors(LEG_IDX, self.stand_pose, LEG_KP, LEG_KD)
+            self._set_motors(WAIST_IDX, WAIST_TARGET, WAIST_KP, WAIST_KD)
+            return self._write()
+
+        if self._rescue:
+            cmd = np.zeros(3, dtype=np.float32)    # Abfangen: am Platz, Joystick egal
+
+        if self.settle.active:
+            # START BALANCING angefordert: mit cmd=0 ausbremsen, bis ruhig.
+            cmd = np.zeros(3, dtype=np.float32)
+            done = self.settle.update(time.perf_counter(), gyro, dq[LEG_IDX],
+                                      self._settle_params())
+            if done is not None:
+                if done == "timeout":
+                    self.get_logger().warn("STAND-Uebergabe: nicht ganz ruhig geworden "
+                                           "-> Timeout, PD uebernimmt trotzdem.")
+                if self._rescue and self._walk_after_rescue:
+                    # START WALKING kam waehrend des Abfangens: jetzt mit der
+                    # Lauf-Policy weiter (frische History aus dem ruhigen Stand).
+                    self.walk_policy.reset()
+                    self._rescue = self._walk_after_rescue = False
+                    self.get_logger().info("Abgefangen -> WALK (Policy).")
+                else:
+                    self._enter_stand("Abgefangen" if self._rescue else "START BALANCING",
+                                      hold_pose=True)
+                    return self._send_balance_pd()
+
+        # KEIN Auto-Umschalten: bei cmd=0 STEHT die Policy einfach am Platz. Zu
+        # wirklich stationaer (Fuesse geplant) wechselt nur der Nutzer per
+        # START BALANCING. Die Policy aktuiert nur Beine + Taille (0..14); die
+        # Arme (15..28) bleiben dem arm_controller (rt/arm_sdk).
+        policy = self.rescue_policy if self._rescue else self.walk_policy
+        # Taille fuehrt hier die Policy; zurueck im Stand startet die
+        # Hueft-Rampe an der dann gemessenen Stellung.
+        self._waist_yaw_cmd = None
+        t = policy.step(q, dq, gyro, gravity, cmd)
+        self._set_motors(t.idx, t.q, t.kp, t.kd)
         self._write()
 
 

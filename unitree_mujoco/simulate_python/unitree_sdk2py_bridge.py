@@ -159,7 +159,14 @@ class UnitreeSdk2Bridge:
             self.managed_weld = False
         self._prev_loco_code = 0
         self.stance_pose = list(getattr(config, "LOCO_STARTUP_HOLD_POSE", [0.0] * 15))
-        self.reset_z_run = float(getattr(config, "LOCO_RESET_PELVIS_Z", 0.78))
+        # Becken-Hoehe beim Aufstellen: None -> aus der Beinpose berechnet (Fuesse
+        # genau auf dem Boden), sonst fester Wert.
+        _z = getattr(config, "LOCO_RESET_PELVIS_Z", None)
+        self.reset_z_run = None if _z is None else float(_z)
+        # Beinpose beim Aufstellen aus dem umschaltenden rt/lowcmd uebernehmen
+        # (loco_sim kommandiert dort die Stand-Pose seiner Lauf-Policy).
+        self.reset_from_cmd = bool(getattr(config, "LOCO_RESET_FROM_CMD", True))
+        self._fk_data = mujoco.MjData(self.mj_model)
         self.spawn_z = float(self.mj_model.qpos0[2])
         if self.managed_weld:
             print("[BRIDGE] Managed-Weld aktiv: Basis gehalten, bis loco_sim balanciert "
@@ -195,6 +202,7 @@ class UnitreeSdk2Bridge:
         self._have_foot_sensing = (
             self._foot_floor_gid >= 0 and self._foot_lbody >= 0 and self._foot_rbody >= 0)
         self._contact_force6 = np.zeros(6, dtype=np.float64)
+        self._foot_cache = (0.0, 0.0, 0.0, 0.0)
         if self._have_foot_sensing:
             print("[BRIDGE] Fuss-Kontakt + Basis-Geschwindigkeit -> reserve[] "
                   "(fuer loco_sim Stepping-Stop).", flush=True)
@@ -330,6 +338,36 @@ class UnitreeSdk2Bridge:
         self.mj_data.qvel[:] = 0.0
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
+    def _stance_from_cmd(self, legs):
+        """Pose fuer den Balancing-Start. Beine/Taille (0..14): die Pose, die loco_sim
+        im umschaltenden rt/lowcmd kommandiert (Stand-Pose seiner Lauf-Policy, bei
+        AGILE die breite Hocke). Plausibilitaet: alle Bein-kp > 0 und |q| < 3 rad,
+        sonst config.LOCO_STARTUP_HOLD_POSE. Arme immer aus der config (Lauf-Pose)."""
+        pose = list(self.stance_pose)
+        if self.reset_from_cmd and legs is not None:
+            cmd = [float(legs.motor_cmd[i].q) for i in range(15)]
+            if (all(float(legs.motor_cmd[i].kp) > 0.0 for i in range(12))
+                    and all(abs(v) < 3.0 for v in cmd)):
+                pose[:15] = cmd
+        return pose
+
+    def _stance_height(self, legw):
+        """Becken-Hoehe, bei der die Fuesse in Pose legw genau auf dem Boden stehen
+        (unterster Punkt der Fuss-Kontakt-Geoms; beim G1 vier Kugeln je Fuss)."""
+        if self.reset_z_run is not None:
+            return self.reset_z_run
+        m, d = self.mj_model, self._fk_data
+        d.qpos[:] = m.qpos0
+        d.qpos[2] = 1.0
+        for i in range(self.num_motor):
+            d.qpos[7 + i] = legw[i] if i < len(legw) else 0.0
+        mujoco.mj_kinematics(m, d)
+        feet = (self._foot_lbody, self._foot_rbody)
+        zmin = min(d.geom_xpos[g][2] - m.geom_rbound[g] for g in range(m.ngeom)
+                   if m.geom_bodyid[g] in feet
+                   and (m.geom_contype[g] or m.geom_conaffinity[g]))
+        return 1.0 - zmin
+
     def _handle_managed_weld(self, legs):
         # Zustands-Code von loco_sim aus rt/lowcmd lesen und Basis entsprechend
         # halten/freigeben. 0=HOLD, 1=RUN (aufstehen+frei), 2=DAMP (frei).
@@ -337,9 +375,12 @@ class UnitreeSdk2Bridge:
         if code == self._prev_loco_code:
             return
         if code == 1:       # Balancing START: in Stand-Pose stellen + Basis freigeben
-            self._reset_pose(self.stance_pose, self.reset_z_run)
+            pose = self._stance_from_cmd(legs)
+            z = self._stance_height(pose)
+            self._reset_pose(pose, z)
             self._set_weld(False)
-            print("[BRIDGE] Balancing START -> Stand-Pose gesetzt, Weld geloest.", flush=True)
+            print(f"[BRIDGE] Balancing START -> Stand-Pose gesetzt (Becken {z:.3f} m), "
+                  "Weld geloest.", flush=True)
         elif code == 0:     # HOLD/Standby: in Spawn-Pose stellen + Basis halten
             self._reset_pose([0.0] * 15 + self.stance_pose[15:], self.spawn_z)
             self._set_weld(True)
@@ -413,6 +454,13 @@ class UnitreeSdk2Bridge:
                 self.mj_data.ctrl[i] = self._startup_pd(i, q, dq)
             else:
                 self.mj_data.ctrl[i] = 0.0
+
+    def cache_foot_state(self):
+        """Von der Sim-Schleife UNTER dem Lock nach jedem Schritt aufrufen
+        (freilaufender Modus): Fusskraefte/Basis-Geschwindigkeit fuer den
+        lowstate-Thread zwischenspeichern."""
+        if self._have_foot_sensing:
+            self._foot_cache = self._foot_forces_and_base_vel()
 
     def _foot_forces_and_base_vel(self):
         """Normalkraft links/rechts [N] aus den MuJoCo-Kontakten (Fuss<->Boden) +
@@ -495,7 +543,14 @@ class UnitreeSdk2Bridge:
                 ]
 
             if self._have_foot_sensing:
-                fl, fr, vx, vy = self._foot_forces_and_base_vel()
+                # Freilaufend (weld) laeuft dieser Thread PARALLEL zu mj_step:
+                # mj_contactForce auf halb aktualisierten Kontakten -> Segfault
+                # (reproduzierbar nach ~20 s). Dort nur den Wert lesen, den die
+                # Sim-Schleife unter dem Lock nach jedem Schritt cached.
+                if self.lockstep:
+                    fl, fr, vx, vy = self._foot_forces_and_base_vel()
+                else:
+                    fl, fr, vx, vy = self._foot_cache
                 self.low_state.reserve[0] = int(min(max(fl, 0.0), 4.0e6))
                 self.low_state.reserve[1] = int(min(max(fr, 0.0), 4.0e6))
                 self.low_state.reserve[2] = int(round((min(max(vx, -10.0), 10.0) + 10.0) * 1000.0))

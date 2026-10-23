@@ -41,6 +41,12 @@ def generate_launch_description():
         # Hand-Posen. Sim setzt schnellere Werte (bringup_sim).
         DeclareLaunchArgument("planned_motion_alpha", default_value="-1.0"),
         DeclareLaunchArgument("hand_only_settle_s", default_value="1.8"),
+        # Glaettung zeitbasiert fuer diese Bezugsrate [Hz] (0 = pro Takt wie
+        # bisher). Sim: 50, damit der Arm auf langsamen PCs nicht nachhinkt.
+        DeclareLaunchArgument("smoothing_ref_hz", default_value="0.0"),
+        # Marker-/Jog-IK im eigenen Prozess (true) statt im Regeltakt (false =
+        # altes Verhalten: Takt nur ~20-40 Hz beim Joggen, Arm rattert).
+        DeclareLaunchArgument("ik_async", default_value="true"),
         # PD-Gains des arm_controller. Defaults = Sim-Tuning (MuJoCo braucht
         # hohe Daempfung); bringup_real ueberschreibt mit den Unitree-
         # Beispielwerten (kp=60, kd=1.5).
@@ -48,11 +54,27 @@ def generate_launch_description():
         DeclareLaunchArgument("kd_low", default_value="12.0"),
         DeclareLaunchArgument("kp_wrist", default_value="40.0"),
         DeclareLaunchArgument("kd_wrist", default_value="4.0"),
+        # Taille (Waist 12-14): wird vom arm_sdk-Gewicht mit umgeschaltet und
+        # deshalb real mitgehalten (Sim: aus). waist_hold=false nur zur Diagnose
+        # (Taille dann kraftlos!). Gains auf Hardware ungeprueft.
+        DeclareLaunchArgument("waist_hold", default_value="true"),
+        DeclareLaunchArgument("kp_waist", default_value="150.0"),
+        DeclareLaunchArgument("kd_waist", default_value="4.0"),
+        # E-Stop: Taille gehalten lassen (nur Arme/Haende schlaff). false = alt.
+        DeclareLaunchArgument("estop_waist_hold", default_value="true"),
+        # Hueftdrehung per Controller/GUI (waist_yaw.py): Bereich um die Mitte.
+        # Real per bringup_real ueber G1_WAIST_YAW_LIMIT_DEG (Default 45).
+        DeclareLaunchArgument("waist_yaw_control", default_value="true"),
+        DeclareLaunchArgument("waist_yaw_limit_deg", default_value="45.0"),
         # arm_sdk-Gewichts-Rampe (0->1 beim Enable, 1->0 beim Disable). Auf dem
         # echten G1 Pflicht fuer eine weiche Uebergabe; die Sim setzt 0.0
         # (= sofort umschalten, bisheriges Verhalten).
         DeclareLaunchArgument("arm_weight_ramp_up_s", default_value="2.0"),
         DeclareLaunchArgument("arm_weight_ramp_down_s", default_value="2.0"),
+        # Echt-Roboter-Absicherung (0 = aus; bringup_real setzt sie): Schlepp-
+        # fehler-Begrenzung [rad] und Anfahrrampe [rad/s^2], siehe arm_controller.
+        DeclareLaunchArgument("max_tracking_error", default_value="0.0"),
+        DeclareLaunchArgument("arm_accel_limit", default_value="0.0"),
         # Marker senden ihr Ziel sofort beim Ziehen (gruener Wuerfel). Steht das
         # auf false, sind die Wuerfel grau und stumm, bis man sie per Rechtsklick-
         # Menue "Enable publishing" aktiviert. Der Arm bewegt sich ohnehin nur,
@@ -60,6 +82,10 @@ def generate_launch_description():
         DeclareLaunchArgument("marker_publish_default", default_value="true"),
         # Leader-Follower: Marker folgt der Hand im Idle (per Streamdeck/Topic schaltbar).
         DeclareLaunchArgument("marker_follow_ee", default_value="true"),
+        # Arme beim Laufen in die Lauf-Pose parken (true, real immer) oder frei
+        # lassen (false: Sim mit der AGILE-Lauf-Policy, setzt bringup_sim). Steuert
+        # arm_controller walk_park_arms und interactive_marker hide_in_walk.
+        DeclareLaunchArgument("walk_park_arms", default_value="true"),
         # Live-Pose-Schnittstelle (siehe g1pilot/docs/21_arm_api_technik.md): HTTP-JSON-Bruecke, damit
         # fremde Projekte OHNE ROS Zielposen einspielen koennen. Bind bewusst auf
         # 127.0.0.1 -- der Container laeuft mit network_mode: host, ein Prozess
@@ -82,6 +108,10 @@ def generate_launch_description():
                     LaunchConfiguration("arm_weight_ramp_up_s"), value_type=float),
                 'arm_weight_ramp_down_s': ParameterValue(
                     LaunchConfiguration("arm_weight_ramp_down_s"), value_type=float),
+                'max_tracking_error': ParameterValue(
+                    LaunchConfiguration("max_tracking_error"), value_type=float),
+                'arm_accel_limit': ParameterValue(
+                    LaunchConfiguration("arm_accel_limit"), value_type=float),
                 'arm_velocity_limit': ParameterValue(
                     arm_velocity_limit, value_type=float),
                 'ee_velocity_limit': ParameterValue(
@@ -96,10 +126,23 @@ def generate_launch_description():
                     LaunchConfiguration("planned_motion_alpha"), value_type=float),
                 'hand_only_settle_s': ParameterValue(
                     LaunchConfiguration("hand_only_settle_s"), value_type=float),
+                'smoothing_ref_hz': ParameterValue(
+                    LaunchConfiguration("smoothing_ref_hz"), value_type=float),
+                'ik_async': ParameterValue(LaunchConfiguration("ik_async"), value_type=bool),
                 'kp_low': ParameterValue(LaunchConfiguration("kp_low"), value_type=float),
                 'kd_low': ParameterValue(LaunchConfiguration("kd_low"), value_type=float),
                 'kp_wrist': ParameterValue(LaunchConfiguration("kp_wrist"), value_type=float),
                 'kd_wrist': ParameterValue(LaunchConfiguration("kd_wrist"), value_type=float),
+                'waist_hold': ParameterValue(LaunchConfiguration("waist_hold"), value_type=bool),
+                'kp_waist': ParameterValue(LaunchConfiguration("kp_waist"), value_type=float),
+                'kd_waist': ParameterValue(LaunchConfiguration("kd_waist"), value_type=float),
+                'estop_waist_hold': ParameterValue(LaunchConfiguration("estop_waist_hold"), value_type=bool),
+                'waist_yaw_control': ParameterValue(
+                    LaunchConfiguration("waist_yaw_control"), value_type=bool),
+                'waist_yaw_limit_deg': ParameterValue(
+                    LaunchConfiguration("waist_yaw_limit_deg"), value_type=float),
+                'walk_park_arms': ParameterValue(
+                    LaunchConfiguration("walk_park_arms"), value_type=bool),
             }],
             output='screen'
         ),
@@ -129,6 +172,8 @@ def generate_launch_description():
                     LaunchConfiguration("marker_publish_default"), value_type=bool),
                 'marker_follow_ee': ParameterValue(
                     LaunchConfiguration("marker_follow_ee"), value_type=bool),
+                'hide_in_walk': ParameterValue(
+                    LaunchConfiguration("walk_park_arms"), value_type=bool),
             }],
             output='screen'
         ),

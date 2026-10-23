@@ -21,7 +21,8 @@
 #
 #  Aufbau (Sim und Real gleich, in der Reihenfolge der Entscheidungen):
 #     Umgebung (nur Sim) bzw. Verbindung (nur Real) -> Bedienoberflaeche
-#     (Demo-GUI / Streamdeck) -> Ausstattung (Haende, Navigation, RViz)
+#     (Demo-GUI / Streamdeck) -> Lauf-Policy (nur Sim) -> Ausstattung
+#     (Haende, Navigation, RViz)
 #     -> eingeklapptes 'Erweitert'. Real zusaetzlich Geh-Limits und das
 #     Sicherheits-Gate. Hand-Oberflaechen im Browser werden nur beim
 #     Streamdeck angeboten -- die Demo-GUI hat die Handsteuerung eingebaut.
@@ -63,6 +64,7 @@ except Exception as exc:  # pragma: no cover - nur wenn tkinter fehlt
 HERE = Path(__file__).resolve().parent                       # .../g1pilot
 REPO_ROOT = HERE.parent                                      # Repo-Wurzel
 START_SH = HERE / "start.sh"
+START_ICON = HERE / "resource" / "icons" / "g1_start.png"
 SCENE_DIR = REPO_ROOT / "unitree_mujoco" / "scene_editor"
 SCENES_DIR = SCENE_DIR / "scenes"
 LAUNCH_SH = SCENE_DIR / "launch.sh"
@@ -272,14 +274,14 @@ def hint(parent, text: str) -> tk.Label:
     return lbl
 
 
-def choice_rows(parent, var: tk.StringVar, choices) -> None:
+def choice_rows(parent, var: tk.StringVar, choices, width: int = 14) -> None:
     """Einzelauswahl als Radiobuttons mit Erklaerung: [(wert, titel, text)]."""
     for value, title, text in choices:
         row = tk.Frame(parent, bg=CARD)
         row.pack(fill="x", pady=1)
         tk.Radiobutton(row, text=title, value=value, variable=var, bg=CARD, fg=FG,
                        selectcolor=BG, activebackground=CARD, activeforeground=FG,
-                       width=14, anchor="w",
+                       width=width, anchor="w",
                        font=("TkDefaultFont", 10, "bold")).pack(side="left")
         tk.Label(row, text=text, bg=CARD, fg=MUTED,
                  font=("TkDefaultFont", 9)).pack(side="left", padx=4)
@@ -710,6 +712,18 @@ GUI_CHOICES = [
 ]
 
 
+# Lauf-Policy von loco_sim (nur Sim; Ordner unter policies/, -> G1_WALK_POLICY).
+WALK_POLICY_CHOICES = [
+    ("g1_wholebody", "Alt (Standard)",
+     "natürlicher Gang; Arme beim Laufen in der Lauf-Pose geparkt"),
+    ("agile_velocity_g1", "AGILE Velocity",
+     "sehr robust, Gang mit Fangschritten; Arme frei"),
+    ("agile_velocity_height_g1", "AGILE Velocity-Height",
+     "gleichmäßiger Gang, bis 1 m/s; Arme frei"),
+]
+DEFAULT_WALK_POLICY = WALK_POLICY_CHOICES[0][0]
+
+
 def gui_section(parent, var: tk.StringVar) -> None:
     s = section(parent, "Bedienoberfläche")
     choice_rows(s, var, GUI_CHOICES)
@@ -743,7 +757,7 @@ def start_footer(frame, app, text: str, cmd, color: str) -> tk.Button:
 # ════════════════════════════════════════════════════════════════════════
 class SimFrame(tk.Frame):
     """Sim-Start. Aufbau in der Reihenfolge der Entscheidungen:
-    Umgebung -> Bedienoberflaeche -> Ausstattung -> Erweitert.
+    Umgebung -> Bedienoberflaeche -> Lauf-Policy -> Ausstattung -> Erweitert.
     Die Auswahl wird gemerkt (settings), Defaults siehe start.sh (Sim-Zweig)."""
 
     ephemeral = True
@@ -766,8 +780,14 @@ class SimFrame(tk.Frame):
         env = st.get("env", "")
         self.v_env = tk.StringVar(value=env if env in scenes else self.DEFAULT_ENV)
         self.v_gui = tk.StringVar(value=st.get("gui", "demo"))
+        policy = st.get("walk_policy", DEFAULT_WALK_POLICY)
+        if policy not in {c[0] for c in WALK_POLICY_CHOICES}:
+            policy = DEFAULT_WALK_POLICY
+        self.v_policy = tk.StringVar(value=policy)
         self.v_hands = tk.BooleanVar(value=st.get("hands", True))
         self.v_nav = tk.BooleanVar(value=st.get("nav", False))
+        self.v_ps4 = tk.BooleanVar(value=st.get("ps4", False))
+        self.v_phone = tk.BooleanVar(value=st.get("phone", False))
         self.v_rviz = tk.BooleanVar(value=st.get("rviz", False))
         self._rviz_own = None   # eigene RViz-Wahl, solange Navigation RViz erzwingt
         self.v_open_guis = tk.BooleanVar(value=st.get("open_guis", False))
@@ -784,7 +804,13 @@ class SimFrame(tk.Frame):
         # 2) Bedienoberflaeche
         gui_section(b, self.v_gui)
 
-        # 3) Ausstattung
+        # 3) Lauf-Policy
+        s = section(b, "Lauf-Policy")
+        choice_rows(s, self.v_policy, WALK_POLICY_CHOICES, width=20)
+        hint(s, "Stehen ist bei allen gleich (Füße bleiben stehen, Schritte nur beim "
+                "Kippen). Vergleich: docs/31_loco_technik.md, Abschnitt „Gangbild“.")
+
+        # 4) Ausstattung
         s = section(b, "Ausstattung")
         toggle_row(s, "Inspire-Hände", self.v_hands,
                    "Finger steuerbar, Kraftsensoren; sonst starre Hände")
@@ -793,12 +819,16 @@ class SimFrame(tk.Frame):
         self._open_row, self._hand_hint = hand_gui_rows(hand_box, self.v_open_guis)
         toggle_row(s, "Navigation", self.v_nav,
                    "Planer + Stationen / AUTO NAV in der Demo-GUI")
+        toggle_row(s, "PS4-Controller", self.v_ps4,
+                   "PS4 oder Xbox: Arme + Hände, Gehen mit L2/LT; Belegung: docs/43_ps4_controller.md")
+        toggle_row(s, "Handy-Zugang (Bluetooth)", self.v_phone,
+                   "nur Demo-GUI; Kopplung über 📱 in der GUI, docs/44_handy_bedienung.md")
         self._rviz_row = toggle_row(s, "RViz", self.v_rviz,
                                     "Zusatzfenster mit TF/Markern; MuJoCo-Fenster kommt immer")
         for v in (self.v_hands, self.v_gui, self.v_nav):
             v.trace_add("write", lambda *_: self._sync())
 
-        # 4) Erweitert
+        # 5) Erweitert
         s = collapsible(b, "Erweitert")
         field_row(s, "Sim-Tempo (1.0 = Echtzeit)", self.v_rt, width=8)
         hint(s, "Kleiner als 1.0 = Zeitlupe (Obergrenze; langsame PCs laufen ohnehin langsamer).")
@@ -836,19 +866,26 @@ class SimFrame(tk.Frame):
         hands = self.v_hands.get()
         gui = self.v_gui.get()
         save_settings("sim", {
-            "env": env_name, "gui": gui, "hands": hands, "nav": self.v_nav.get(),
+            "env": env_name, "gui": gui, "walk_policy": self.v_policy.get(),
+            "hands": hands, "nav": self.v_nav.get(),
             "rviz": self.v_rviz.get() if self._rviz_own is None else self._rviz_own,
-            "open_guis": self.v_open_guis.get(), "rt": rt,
+            "open_guis": self.v_open_guis.get(), "rt": rt, "ps4": self.v_ps4.get(),
+            "phone": self.v_phone.get(),
         })
 
         env = os.environ.copy()
         env["G1_MODE"] = "sim"
         env["G1_ENV"] = env_name
         env["G1_GUI"] = gui
+        env["G1_WALK_POLICY"] = self.v_policy.get()
         env["G1_INSPIRE_HANDS"] = "1" if hands else "0"
         env["OPEN_GUIS"] = "true" if (hands and gui == "streamdeck"
                                       and self.v_open_guis.get()) else "false"
         env["G1_ENABLE_NAV"] = "1" if self.v_nav.get() else "0"
+        env["G1_PS4_ARMS"] = "1" if self.v_ps4.get() else "0"
+        env["G1_PHONE"] = "1" if self.v_phone.get() and gui == "demo" else "0"
+        # BlueZ ueber den System-D-Bus geht nur ohne Dockers AppArmor-Profil (docker-compose.yml).
+        env["G1_SIM_APPARMOR"] = "unconfined" if env["G1_PHONE"] == "1" else "docker-default"
         env["USE_RVIZ"] = "true" if self.v_rviz.get() else "false"
         env["SIM_REALTIME_FACTOR"] = rt
 
@@ -895,6 +932,8 @@ class RealFrame(tk.Frame):
         self.v_vyaw = tk.StringVar(value=st.get("vyaw", "0.4"))
         self.v_port = tk.StringVar(value=st.get("port", "6000"))
         self.v_joy = tk.StringVar(value=st.get("joy", "Wireless Controller"))
+        self.v_ps4 = tk.BooleanVar(value=st.get("ps4", False))
+        self.v_phone = tk.BooleanVar(value=st.get("phone", False))
         self.v_lidar = tk.BooleanVar(value=False)
         self.v_rebuild = tk.BooleanVar(value=False)
         self.v_confirm = tk.BooleanVar(value=False)
@@ -934,6 +973,10 @@ class RealFrame(tk.Frame):
         field_row(self._hand_box, "IP rechte Hand", self.v_right)
         self._open_row, self._hand_hint = hand_gui_rows(self._hand_box, self.v_open_guis)
         toggle_row(s, "RViz", self.v_rviz, "empfohlen: Arm-Marker + Zustand sichtbar")
+        toggle_row(s, "PS4-Controller für Arme + Hände", self.v_ps4,
+                   "PS4 oder Xbox; aus = Gehen mit Deadman (bisher, nur PS4)")
+        toggle_row(s, "Handy-Zugang (Bluetooth)", self.v_phone,
+                   "nur Demo-GUI; Ansicht, NOT-HALT, Quittieren, Startleiste (docs/44_handy_bedienung.md)")
         for v in (self.v_hands, self.v_gui):
             v.trace_add("write", lambda *_: self._sync())
 
@@ -964,8 +1007,9 @@ class RealFrame(tk.Frame):
                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w", padx=12, pady=(8, 0))
         tk.Label(gate,
                  text=("Kein Auto-Start: der Roboter bewegt sich erst, wenn er in der\n"
-                       "Bedienoberfläche gestartet wird (Demo-GUI: »Roboter starten«,\n"
-                       "Streamdeck: START). NOT-HALT = Damp = Roboter sackt zusammen (sichern!).\n"
+                       "Bedienoberfläche gestartet wird (Demo-GUI: »Start« in der Startleiste,\n"
+                       "Streamdeck: START). NOT-HALT: Arme schlaff, Beine bleiben stehen.\n"
+                       "Voll-Notaus (Controller R1+L1+PS 2 s) = Damp = sackt in den Kran.\n"
                        "Checkliste vorher: g1pilot/docs/70_echtroboter_anleitung.md"),
                  bg="#3a2326", fg=FG, justify="left",
                  font=("TkDefaultFont", 9)).pack(anchor="w", padx=12, pady=(2, 6))
@@ -1019,6 +1063,7 @@ class RealFrame(tk.Frame):
             "vy": self.v_vy.get().strip() or "0.3",
             "vyaw": self.v_vyaw.get().strip() or "0.4",
             "joy": self.v_joy.get().strip() or "Wireless Controller",
+            "ps4": self.v_ps4.get(), "phone": self.v_phone.get(),
         }
         save_settings("real", vals)
 
@@ -1036,6 +1081,8 @@ class RealFrame(tk.Frame):
         env["USE_RVIZ"] = "true" if vals["rviz"] else "false"
         env["G1_ENABLE_LIDAR"] = "1" if self.v_lidar.get() else "0"
         env["JOYSTICK_NAME"] = vals["joy"]
+        env["G1_PS4_ARMS"] = "1" if vals["ps4"] else "0"
+        env["G1_PHONE"] = "1" if vals["phone"] and gui == "demo" else "0"
         env["G1_MAX_VX"] = vals["vx"]
         env["G1_MAX_VY"] = vals["vy"]
         env["G1_MAX_VYAW"] = vals["vyaw"]
@@ -1257,8 +1304,10 @@ class MenuFrame(tk.Frame):
 # ════════════════════════════════════════════════════════════════════════
 class App(tk.Tk):
     def __init__(self):
-        super().__init__()
+        # className -> WM_CLASS "g1-start"/"G1-start": eigener Dock-Eintrag.
+        super().__init__(className="g1-start")
         self.title("G1 — Startmenü")
+        self._set_icon()
         self.configure(bg=BG)
         self.geometry("900x760")
         self.minsize(700, 600)
@@ -1281,6 +1330,14 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._quit)
         self.show_menu()
         self.after(200, self.refresh_status)
+
+    def _set_icon(self) -> None:
+        """Eigenes Fenster-Icon statt Zahnrad (gilt auch fuer alle Dialoge)."""
+        try:
+            self._icon = tk.PhotoImage(file=str(START_ICON))
+            self.iconphoto(True, self._icon)
+        except Exception:
+            pass  # rein kosmetisch (z. B. Tk < 8.6 ohne PNG-Support)
 
     # ── Router ────────────────────────────────────────────────────────────
     def show(self, frame) -> None:

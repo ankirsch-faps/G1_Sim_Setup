@@ -36,6 +36,8 @@ setup(
         # Inspire-FTP-Hand HTML-GUIs (Controller/Viewer) – im Browser zu oeffnen.
         (f'share/{package_name}/manipulation/inspire_ftp/web',
             expand(['g1pilot/manipulation/inspire_ftp/web/*.html'])),
+        (f'share/{package_name}/teleoperation/phone/web',
+            expand(['g1pilot/teleoperation/phone/web/*'])),
 
         # URDF / XML
         (f'share/{package_name}/description_files/urdf',
@@ -53,11 +55,25 @@ setup(
         (f'share/{package_name}/config',
             expand(['config/*.yaml', 'config/*.rviz'])),
 
+        # Fenster-Icons (Dock/Taskleiste), siehe g1pilot/utils/window_style.py
+        (f'share/{package_name}/resource/icons',
+            expand(['resource/icons/*.png', 'resource/icons/*.svg'])),
+
         # MOLA LiDAR-odometry pipeline (used by mola_launcher.launch.py)
         (f'share/{package_name}/pipelines',
             expand(['pipelines/*.yaml'])),
 
-        # Whole-Body-Loco-Policy fuer loco_sim (unitree_rl_mjlab G1 Velocity).
+        # Lauf-Policy fuer loco_sim (Default): NVIDIA WBC-AGILE Velocity-G1-History.
+        (f'share/{package_name}/policies/agile_velocity_g1',
+            expand(['policies/agile_velocity_g1/*.onnx', 'policies/agile_velocity_g1/*.yaml',
+                    'policies/agile_velocity_g1/*.md', 'policies/agile_velocity_g1/LICENSE'])),
+        # Alternative: NVIDIA WBC-AGILE Velocity-Height-G1-History (gleichmaessiger Gang).
+        (f'share/{package_name}/policies/agile_velocity_height_g1',
+            expand(['policies/agile_velocity_height_g1/*.onnx',
+                    'policies/agile_velocity_height_g1/*.yaml',
+                    'policies/agile_velocity_height_g1/*.md',
+                    'policies/agile_velocity_height_g1/LICENSE'])),
+        # Legacy-Lauf-Policy (unitree_rl_mjlab G1 Velocity), per loco_sim policy:=g1_wholebody.
         (f'share/{package_name}/policies/g1_wholebody',
             expand(['policies/g1_wholebody/*.onnx', 'policies/g1_wholebody/*.yaml',
                     'policies/g1_wholebody/*.md', 'policies/g1_wholebody/LICENSE'])),
@@ -88,6 +104,12 @@ setup(
             'ui_interface = g1pilot.teleoperation.ui_interface:main',
             # Vereinfachte Demo-Oberflaeche (Konzept), Auswahl via G1_GUI=demo.
             'demo_gui = g1pilot.teleoperation.demo_gui:main',
+            # PS4-Controller fuer den Oberkoerper (nur Arme/Haende, kein Laufen):
+            # evdev -> /g1pilot/ps4/joy (feste Belegung) -> Hand-Ziele/Hand-Aktionen.
+            # Siehe g1pilot/docs/43_ps4_controller.md, Start via G1_PS4_ARMS=1.
+            'ps4_joystick = g1pilot.teleoperation.ps4_joystick:main',
+            'ps4_arm_teleop = g1pilot.teleoperation.ps4_arm_teleop:main',
+            'ps4_walk = g1pilot.teleoperation.ps4_walk:main',
 
             # Navigation Nodes
             'loco_client = g1pilot.navigation.loco_client:main',

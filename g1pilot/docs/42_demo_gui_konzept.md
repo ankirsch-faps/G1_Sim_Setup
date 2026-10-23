@@ -27,6 +27,7 @@ ergeben. Die Demo-GUI reduziert die Bedienung auf **eine Entscheidung zur Zeit**
 │  GREIFEN              [ ARME | HÄNDE ]                           │
 │  ──────────────────────────────────────────────────────────────  │
 │   Abläufe: [ Arbeitsplatz 1 ] [ Arbeitsplatz 2 ]                 │
+│   [Am Stück|Schritt für Schritt] [ Weiter ▶ ] [Posen & Abläufe…] │
 │   [Sichere Pose]   [Grundstellung]   [Bewegung stoppen]          │
 │   Erweitert ▸   (Pose anfahren … / Pose speichern … / Marker)    │
 │                                                                  │
@@ -46,7 +47,7 @@ Zwei große Kacheln, **genau eine** ist aktiv:
 
 | Kachel | Bedeutung | Topics |
 |---|---|---|
-| GEHEN (blau) | Lauf-Policy, Arme eingeklappt | `/g1pilot/start_walking` |
+| GEHEN (blau) | Lauf-Regler; Arme eingeklappt (Sim mit AGILE-Policy: Arme frei) | `/g1pilot/start_walking` |
 | GREIFEN (orange) | Stand mit geplanten Füßen, Arme frei | `/g1pilot/arms/enabled` + `/g1pilot/start_balancing` |
 
 Jede Kachel hat drei klar unterscheidbare Zustände:
@@ -55,12 +56,27 @@ Jede Kachel hat drei klar unterscheidbare Zustände:
 - **wechselt …**: gestrichelter Rand in Modusfarbe. Das gibt es nur beim Wechsel
   zu GEHEN, weil die Arme erst in die Lauf-Pose fahren. Bestätigt wird der Wechsel
   durch `/g1pilot/arms/walk_ready`, spätestens nach 6 s (Timeout, wie in
-  `loco_sim`).
+  `loco_sim`). Mit einer AGILE-Lauf-Policy in der Sim bleiben die Arme frei,
+  `walk_ready` kommt sofort.
 - **inaktiv**: dunkelgrau, „antippen zum Wechseln“
 
-Auf dem echten Roboter sind die Kacheln gesperrt, bis „Roboter starten“
-(`/g1pilot/start`) gedrückt wurde. Nach einem NOT-HALT ist das wieder nötig.
+Auf dem echten Roboter sind die Kacheln gesperrt, bis **Start** gedrückt
+wurde. Start ist der erste Knopf der Startleiste (eine Zeile: *Start | Damp |
+Preparation | Walk |* Rückmeldung des loco_client) und sendet `/g1pilot/start`:
+gibt die Kacheln frei, quittiert einen NOT-HALT (arm_controller, loco_client,
+Controller) und stellt einen G1, der noch in Damp/Zero-Torque liegt, auf
+Preparation (FSM 4); steht er schon (Preparation/Walk), schaltet Start nichts um.
+Danach ist der Knopf grau (*Gestartet ✓*), nach einem NOT-HALT wieder frei
+(*NOT-HALT quittieren*). Der Controller-Zustand steht nicht mehr als eigene
+Zeile in der GUI (Modus, Hand und Tempo zeigt die GUI selbst); solange ein
+Controller aktiv ist, zeigt *🎮 Belegung* oben rechts die Tastenbelegung.
 In der Sim startet die GUI wie der Streamdeck nach 3 s automatisch in GREIFEN.
+
+**Mit Controller (PS4/Xbox) gekoppelt:** Kacheln, Hand-Auswahl, Tempo »Hand
+bewegen« und Geh-Tempo teilen sich GUI und Controller
+(`/g1pilot/teleop_state`). L2 am Controller → Kachel GEHEN, R2 → GREIFEN;
+die GUI sendet dabei selbst nichts. Details:
+[43_ps4_controller.md › Controller und Demo-GUI gekoppelt](43_ps4_controller.md#controller-und-demo-gui-gekoppelt).
 
 ### 2 · Steuerung (Mitte)
 
@@ -106,18 +122,53 @@ Titelzeile vom Inhalt (auch bei GEHEN).
 
 *Seite ARME*
 
-- **Abläufe**: jede Pose-Store-Kategorie `Ablauf <Name>` wird ein eigener
-  Knopf „<Name>“; ihre Posen laufen in Namensreihenfolge ab (`AP1_01_…`,
-  `AP1_02_…`), die Statuszeile zeigt „Schritt n/m“. Ablauf-Posen erscheinen
-  nicht als Einzelknöpfe. Reine Hand-Posen (nur `left_hand`/`right_hand`)
-  melden nach `hand_only_settle_s` (1.8 s) `reached`. Beispiel-Abläufe für die
-  Szene A5 (Arbeitsplatz 1: Zylinder links greifen und an rechts übergeben;
-  Arbeitsplatz 2: blaue KLT mit beiden Händen anheben) installiert
-  `python3 -m g1pilot.tools.install_example_sequences`; sie gelten für den
-  Roboter genau an der jeweiligen Station. Der nächste Schritt startet erst,
-  wenn `/g1pilot/arm_command/status` `reached` meldet. Bei
-  `failed`/`rejected`/`cancelled` bricht der Ablauf ab und der Grund steht im
-  Status. Gibt es noch keine Abläufe, erklärt ein Hinweis, wie man einen anlegt.
+- **Abläufe** (seit 2026-10-22): ein Ablauf ist eine Liste von **Verweisen auf
+  gespeicherte Posen** im Pose-Store (`sequences`, siehe
+  [11_arm_manipulation_technik.md](11_arm_manipulation_technik.md)). Dieselbe
+  Pose (z. B. `Sichere_Pose`) kann in mehreren Abläufen und mehrfach in einem
+  stehen, ohne Kopie und ohne Umbenennen. Jeder Ablauf mit mindestens einem
+  Schritt wird ein Knopf „<Name>“, die Statuszeile zeigt „Schritt n/m“.
+  Jeder Schritt ist ein geplantes POSE ANFAHREN (Kollisionsschutz wie immer);
+  reine Hand-Posen melden nach `hand_only_settle_s` (1.8 s) `reached`.
+  Beispiel-Abläufe für die Szene A5 installiert
+  `python3 -m g1pilot.tools.install_example_sequences` (gelten genau an der
+  jeweiligen Station). Fehlt eine Pose eines Ablaufs, startet er nicht und der
+  Status nennt sie.
+- **Am Stück | Schritt für Schritt** (Umschalter unter den Ablauf-Knöpfen):
+  *Am Stück* fährt nach jedem `reached` (+ optionaler Pause des Schritts)
+  sofort weiter. *Schritt für Schritt* hält nach jedem Schritt an; weiter geht
+  es erst mit **Weiter ▶** (GUI), am Handy oder mit **L3** am PS4-/Xbox-
+  Controller (Controller vibriert kurz, sobald der Ablauf wartet). Der
+  Umschalter wirkt auch während eines Ablaufs ab dem nächsten Schritt; so
+  hält man einen Ablauf am Stück an. Start: **real Schritt für Schritt, Sim
+  am Stück** (`G1_SEQUENCE_MODE=auto|step`).
+- **Abbruch**: `failed`/`rejected`/`cancelled` der laufenden Fahrt, NOT-HALT
+  (GUI, Controller PS, Voll-Notaus, Handy, Streamdeck), Stopp (Knopf
+  „Bewegung stoppen“, Controller Kreuz, `/g1pilot/pose_store/cancel`),
+  Moduswechsel und „Hand bewegen“ während einer Fahrt beenden den Ablauf, auch
+  wenn er gerade auf „Weiter“ wartet. Danach geht es nie von selbst weiter,
+  auch nicht nach dem Quittieren. Wartet ein Ablauf, darf man die Hand mit Jog
+  oder Controller nachkorrigieren; der nächste Schritt wird von dort geplant.
+  Solange ein Schritt fährt, sind die Controller-Sticks gesperrt (Anzeige
+  „ABLAUF fährt“), damit ein versehentlich bewegter Stick die Fahrt nicht mit
+  „manueller Vorrang“ abbricht; Kreuz = Stopp geht immer.
+  Kommt auf ein Anfahren 4 s keine Antwort vom Arm-Regler (Arme nicht
+  übernommen), bricht der Ablauf mit Hinweis ab.
+- **Posen & Abläufe …** öffnet das Fenster zum Zusammenstellen (nicht modal,
+  man kann nebenher die Hand bewegen): links die Abläufe (neu, umbenennen,
+  kopieren, löschen, starten), in der Mitte die Schritte (ziehen oder ▲/▼,
+  entfernen, Pause nach dem Schritt für „Am Stück“) und **„＋ Aktuelle Stellung
+  als Schritt …“** (speichert die Pose und hängt sie an, nachdem der
+  Arm-Controller das Speichern quittiert hat), rechts alle Posen nach Kategorie
+  (Doppelklick oder „← Hinzufügen“ hängt hinter dem markierten Schritt an,
+  Anfahren, Löschen, aktuelle Stellung speichern). Ganz oben stehen die
+  **relativen Bewegungen** (z. B. „Box anheben“ = Hände 5 cm hoch, egal wo sie
+  gerade sind): *Neue relative Bewegung …* / *Bearbeiten …* mit Name, vor/
+  links/hoch in cm (je höchstens ±30 cm, Bezug Oberkörper) und welche Hand;
+  sie werden wie Posen eingefügt (Schritt „↕ Box anheben (hoch 5 cm · beide)“)
+  und geplant angefahren. Jede Änderung wird sofort
+  gespeichert. Auch der Dialog „Pose speichern“ hat das Feld **An Ablauf
+  anhängen** (neuer Name legt den Ablauf an).
 - **Sichere Pose** fährt die gespeicherte Pose `Sichere_Pose` geplant an
   (Arme hoch, Ellbogen hinten; Hinweis, falls sie fehlt; Name über
   `G1_SAFE_POSE` änderbar). **Grundstellung** sendet `/g1pilot/arms/home`: der
@@ -168,6 +219,20 @@ der Hand-Bridge (`hand_controller_viewer.html`, `inspire_hand_viewer.html`):
   `make sim` gestartet) macht daraufhin `docker compose kill` + `down`, also
   sofort und ohne langsames Herunterfahren. Ohne Watcher (z. B. `make sim-bg`)
   meldet die GUI nach 3 s, dass es nur mit `make stop` im Terminal geht.
+- **Real beenden** (nur echter Roboter, gleiche Doppelklick-Bestätigung):
+  beendet den Stack sicher. Zuerst wird alles angehalten (Ablauf, AUTO NAV,
+  Hand bewegen, Gehen über `start_walking` False, also StopMove). Dann gehen
+  die Arme aus (`arms/enabled` False). Der arm_controller fährt sie in die
+  Pose vom ENABLE zurück und rampt das Gewicht auf 0. Erst wenn
+  `/g1pilot/arms/state` False meldet und die Rampe durch ist (2,5 s), legt die
+  GUI `.real_shutdown_request` an. Der Host-Watcher
+  `docker/real_shutdown_watcher.sh` (von `./start.sh`, `make real` und
+  `make real-full` gestartet) stoppt den Stack **sanft** mit
+  `docker compose stop` (SIGTERM) + `down`. Die Beine bleiben im
+  Onboard-Zustand, es gibt kein Damp: Den Roboter danach per Fernbedienung
+  ablegen. Kommt vom Arm-Regler 20 s lang keine Quittung, wird trotzdem
+  beendet. Er gibt die Arme beim SIGTERM selbst ab. NOT-HALT bricht
+  „Real beenden“ ab.
 - Die **Statuszeile** steht über die volle Breite, die Knöpfe darunter.
 
 ## Bedienen
@@ -177,9 +242,26 @@ der Hand-Bridge (`hand_controller_viewer.html`, `inspire_hand_viewer.html`):
 ./start.sh --menu   # Text-Menü: 2) Bedienoberfläche → Demo-GUI
 ```
 
-Ablauf anlegen: GREIFEN → Erweitert → *Pose speichern …*, Kategorie
-`Ablauf <Name>`, Posen in Reihenfolge benennen (`AP1_01_…`, `AP1_02_…`).
-Der Ablauf erscheint danach als Knopf „<Name>“.
+Ablauf anlegen: GREIFEN → **Posen & Abläufe …** → *Neu …*, dann Posen aus
+der Liste rechts hinzufügen oder die Hand hinstellen und **„＋ Aktuelle
+Stellung als Schritt …“**. Für „Box greifen, anheben, ablegen“: Pose
+*Greifen*, dann relative Bewegung *Box anheben* (hoch 5 cm), dann die
+Ablage-Pose. Der Ablauf erscheint als Knopf „<Name>“. Die alte
+Arbeitsweise geht weiter: eine Pose in die Kategorie `Ablauf <Name>`
+speichern hängt sie hinten an den Ablauf <Name> an. Bestehende Kategorien
+`Ablauf …` werden beim ersten Speichern als Abläufe übernommen (Reihenfolge
+wie bisher nach Namen).
+
+**Fenstergröße / Vollbild:** Die Demo-GUI startet maximiert. Der Steuerbereich
+liegt in einem Scrollbereich, damit die Mindesthöhe des Fensters klein bleibt
+(~600 px; vorher ~1160 px, höher als ein 1080er-Schirm: der Fenstermanager bot
+dann kein Maximieren an und auch das Vollbild blieb größer als der Schirm).
+Ab ca. 1000 px Höhe passt alles ohne Scrollen. Knopf *⛶ Vollbild* oben rechts
+in der Zeile „1 · MODUS“, im Vollbild heißt er *Vollbild beenden*. Tasten: **F11**
+schaltet um, **Esc** verlässt das Vollbild. Funktioniert auch ohne Titelleiste
+des Fenstermanagers (Roboter-Rechner). `G1_GUI_FULLSCREEN=1` startet die
+Demo-GUI direkt im Vollbild (Default 0 = maximiert). Reine Fensterfunktion,
+sendet nichts an den Roboter.
 
 ## Technik
 

@@ -19,10 +19,15 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, String
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from std_msgs.msg import Float32, Bool, String
 from geometry_msgs.msg import Twist
-from g1pilot.utils.window_style import DarkStyle
+from g1pilot.utils.window_style import DarkStyle, set_app_identity
 from g1pilot.utils.common import is_sim_mode
+from g1pilot.utils import push_charge
+from g1pilot.utils.push_charge import PushCharger
+from g1pilot.teleoperation.sim_autostart import (
+    SimAutoStart, ARMS_STATE_TOPIC, LOCO_STATE_TOPIC)
 
 
 class VirtualJoystick(QWidget):
@@ -108,9 +113,15 @@ class PoseSaveDialog(QDialog):
     aus der Version, in der beide Haende eine einzige Komponente waren, und
     kostete nur Klicks. Ergebnis via result_data() als
     {"name", "category", "components"} -- genau das JSON, das
-    arm_controller._on_pose_save erwartet."""
+    arm_controller._on_pose_save erwartet.
 
-    def __init__(self, parent, store=None, categories=None):
+    Demo-GUI: mit `sequences` (Liste der Ablaeufe) gibt es zusaetzlich »An
+    Ablauf anhängen« (`sequence` vorausgewaehlt); result_data() traegt dann
+    "sequence" (Name oder None) -- die GUI nimmt es vor dem Senden heraus."""
+
+    NO_SEQUENCE = "— nicht anhängen —"
+
+    def __init__(self, parent, store=None, categories=None, sequences=None, sequence=None):
         super().__init__(parent)
         self._store = store
         self.setWindowTitle("Pose speichern")
@@ -131,6 +142,15 @@ class PoseSaveDialog(QDialog):
         cat_row.addWidget(self.cb_category, 1)
         cat_row.addWidget(btn_new_cat)
         form.addRow("Kategorie:", cat_row)
+        self.cb_sequence = None
+        if sequences is not None:
+            self.cb_sequence = QComboBox()
+            self.cb_sequence.setEditable(True)     # neuer Name = neuer Ablauf
+            self.cb_sequence.addItems([self.NO_SEQUENCE] + list(sequences))
+            self.cb_sequence.setCurrentText(sequence or self.NO_SEQUENCE)
+            self.cb_sequence.setToolTip("Gespeicherte Pose hinten an diesen Ablauf hängen "
+                                        "(neuer Name legt den Ablauf an).")
+            form.addRow("An Ablauf anhängen:", self.cb_sequence)
         root.addLayout(form)
 
         box = QGroupBox("Was speichern?")
@@ -192,11 +212,15 @@ class PoseSaveDialog(QDialog):
         self.accept()
 
     def result_data(self):
-        return {
+        out = {
             "name": self.ed_name.text().strip(),
             "category": self.cb_category.currentText().strip(),
             "components": self._components(),
         }
+        if self.cb_sequence is not None:
+            seq = self.cb_sequence.currentText().strip()
+            out["sequence"] = None if seq in ("", self.NO_SEQUENCE) else seq
+        return out
 
 
 class PoseLoadDialog(QDialog):
@@ -287,6 +311,8 @@ class StreamDeck(Node):
         self.pub_right_hand = self.create_publisher(String, '/g1pilot/hand_action/right', 10)
         self.pub_emergency_stop = self.create_publisher(Bool, '/g1pilot/emergency_stop', 10)
         self.pub_push = self.create_publisher(Bool, '/g1pilot/push', 10)
+        # Aufladbarer Schubs: Ladegrad 0..1 beim Loslassen (siehe utils/push_charge.py).
+        self.pub_push_charge = self.create_publisher(Float32, '/g1pilot/push_charge', 10)
         self.pub_grasp_box = self.create_publisher(Bool, '/g1pilot/grasp_box', 10)
         self.pub_scene_reset = self.create_publisher(Bool, '/g1pilot/scene_reset', 10)
         self.pub_catch_falls = self.create_publisher(Bool, '/g1pilot/catch_falls', 10)
@@ -294,11 +320,36 @@ class StreamDeck(Node):
         self.pub_pose_save = self.create_publisher(String, '/g1pilot/pose_store/save', 10)
         self.pub_pose_goto = self.create_publisher(String, '/g1pilot/pose_store/goto', 10)
         self.pub_pose_cancel = self.create_publisher(Bool, '/g1pilot/pose_store/cancel', 10)
+        # NOT-HALT kann auch von aussen kommen (PS-Taste am PS4-Controller,
+        # ps4_arm_teleop): die GUI zeigt ihn dann genauso an wie den eigenen.
+        # Der Callback laeuft im Qt-Thread (spin_once im QTimer).
+        self.on_emergency_stop = None
+        self.create_subscription(Bool, '/g1pilot/emergency_stop', self._emergency_stop, 10)
+        # Quittung fuer den Sim-Auto-Start (sim_autostart.py): Zustand von
+        # arm_controller (Arme aktiv?) und loco_sim (hold|stand|walk|damp), latched.
+        self.arms_state = None
+        self.loco_state = None
+        qos_latched = QoSProfile(depth=1)
+        qos_latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(Bool, ARMS_STATE_TOPIC,
+                                 lambda m: setattr(self, 'arms_state', bool(m.data)), qos_latched)
+        self.create_subscription(String, LOCO_STATE_TOPIC,
+                                 lambda m: setattr(self, 'loco_state', m.data), qos_latched)
+
+    def _emergency_stop(self, msg: Bool):
+        if msg.data and self.on_emergency_stop:
+            self.on_emergency_stop()
 
     def publish_bool(self, pub, value: bool):
         msg = Bool()
         msg.data = value
         pub.publish(msg)
+
+    def publish_push_charge(self, level: float):
+        """Ladegrad 0..1 des Schubses (0 = kurzer Klick) an loco_sim."""
+        msg = Float32()
+        msg.data = float(level)
+        self.pub_push_charge.publish(msg)
 
     def publish_str(self, pub, text: str):
         msg = String()
@@ -319,6 +370,8 @@ class ButtonGUI(QWidget):
         }
 
         self.sim_mode = is_sim_mode()
+        ros_node.on_emergency_stop = self._show_emergency_stop
+        self._estop_pressed = False
         self.setWindowTitle("DIGITAL STREAMDECK — "
                             + ("SIM" if self.sim_mode else "REAL"))
         self.init_ui()
@@ -331,12 +384,23 @@ class ButtonGUI(QWidget):
         self.cmd_timer.timeout.connect(self.publish_cmd_vel)
         self.cmd_timer.start(33)
 
-        # Nach kurzer Anlaufzeit (DDS/loco_sim/arm_controller verbunden) automatisch
-        # die Arme aktivieren und in den BALANCING-Stand gehen. NUR EINMAL feuern (3s):
-        # ein zweiter Auto-Start (frueher 6s) loeste einen Ruck/Sturz aus.
+        # Nach kurzer Anlaufzeit automatisch die Arme aktivieren und in den
+        # BALANCING-Stand gehen. Wiederholt, bis arm_controller und loco_sim es
+        # bestaetigen (sim_autostart.py) -- frueher nur EIN Versuch nach 3 s, der
+        # verloren ging, wenn die Regler noch luden (Arme blieben aus). Wiederholt
+        # wird nur, was noch fehlt; ein bereits stehender Roboter bekommt kein
+        # zweites BALANCING (ein zweiter Auto-Start loeste frueher einen Ruck aus).
         # NUR IN DER SIM: auf dem echten G1 darf NIE automatisch balanciert oder
         # arm_sdk aktiviert werden -- der Operator entscheidet, wann der Roboter
         # sich bewegt. Bewusst hart verdrahtet (kein Parameter zum Umgehen).
+        self.autostart = SimAutoStart(
+            lambda: self.node.publish_bool(self.node.pub_arms_enabled, True),
+            lambda: self.node.publish_bool(self.node.pub_start_balancing, True),
+            log=lambda t: self.node.get_logger().info(t))
+        self.autostart_timer = QTimer(self)
+        self.autostart_timer.timeout.connect(
+            lambda: self.autostart.tick(self.node.arms_state, self.node.loco_state))
+        self.autostart_timer.start(100)
         if self.sim_mode:
             QTimer.singleShot(3000, self._auto_start)
         else:
@@ -403,9 +467,9 @@ class ButtonGUI(QWidget):
         # Stoerunterdrueckung des Balancers zu pruefen. Auf dem echten G1 gibt
         # es keinen Empfaenger und der Button waere nur eine Falle -> nur Sim.
         if self.sim_mode:
-            button_actions[(1, 4)] = (
-                "PUSH\nROBOT",
-                lambda: self.flash_button((1, 4), self.node.pub_push, duration=400))
+            # Kurz klicken = Schubs wie bisher; Halten = aufladen (Anzeige im Button),
+            # Loslassen schubst mit der aufgeladenen Kraft (utils/push_charge.py).
+            button_actions[(1, 4)] = ("PUSH\nROBOT", None)
 
             # Greifbare Test-Kugel in der Sim an/aus (Toggle). Nur Sim: die echte Hand
             # hat kein solches Objekt -> auf Real waere der Button eine Falle.
@@ -438,7 +502,10 @@ class ButtonGUI(QWidget):
                 else:
                     label, func = action
                     btn.setText(label)
-                    btn.clicked.connect(func)
+                    if func is None:
+                        self._wire_push_button((r, c), btn, label)
+                    else:
+                        btn.clicked.connect(func)
                     if (r, c) == (4, 4):
                         btn.setStyleSheet("""
                             QPushButton {
@@ -549,6 +616,37 @@ class ButtonGUI(QWidget):
 
         self.button_states[pos] = active
 
+    def _wire_push_button(self, pos, btn, label):
+        """PUSH ROBOT: Halten laedt den Schubs auf, Loslassen schubst.
+        Waehrend des Haltens zeigt der Button Ladegrad und Kraft."""
+        charger = PushCharger()
+        timer = QTimer(self)
+        timer.setInterval(50)
+
+        def refresh():
+            lvl = charger.level()
+            if lvl > 0.0:
+                btn.setText(f"PUSH {lvl*100:.0f} %\n{push_charge.force_for_level(lvl):.0f} N")
+
+        def pressed():
+            charger.press()
+            self.set_button_active(pos, True)
+            timer.start()
+
+        def released():
+            if not charger.holding:
+                return
+            timer.stop()
+            lvl = charger.release()
+            self.node.publish_push_charge(lvl)
+            btn.setText(label)
+            self.set_button_active(pos, False)
+
+        timer.timeout.connect(refresh)
+        btn.pressed.connect(pressed)
+        btn.released.connect(released)
+        self._push_timer = timer
+
     def flash_button(self, pos, pub, duration=1000):
         """Temporarily activates button for <duration> ms then resets."""
         self.set_button_active(pos, True)
@@ -564,6 +662,8 @@ class ButtonGUI(QWidget):
         self.node.publish_bool(pub, False)
 
     def toggle_button(self, pos, pub):
+        if pos == (1, 0):
+            self.autostart.cancel("ENABLE MANIPULATION")
         new_state = not self.button_states[pos]
         self.set_button_active(pos, new_state)
         self.node.publish_bool(pub, new_state)
@@ -571,6 +671,7 @@ class ButtonGUI(QWidget):
     def radio_loco(self, pos, pub):
         """Loco-Radio: genau EINEN der Loco-Buttons (BALANCING/WALK) gruen schalten
         und True publizieren. Kein automatisches Umschalten — nur dieser Klick."""
+        self.autostart.cancel("Loco-Knopf")
         for p in self.loco_group:
             self.set_button_active(p, p == pos)
         self.node.publish_bool(pub, True)
@@ -579,9 +680,12 @@ class ButtonGUI(QWidget):
         """Direkt nach Launch: Arme aktivieren (werden ab jetzt dauerhaft vom
         arm_controller gehalten und sind per rviz bewegbar) und in den BALANCING-
         Stand gehen. So steht der Roboter sofort stabil, ohne Knopfdruck."""
+        if self._estop_pressed:
+            return
         self.set_button_active((1, 0), True)
-        self.node.publish_bool(self.node.pub_arms_enabled, True)
-        self.radio_loco((0, 1), self.node.pub_start_balancing)
+        for p in self.loco_group:
+            self.set_button_active(p, p == (0, 1))
+        self.autostart.start()
 
     # Bind-Mount-Pfad des Repos IM Container (docker-compose: .:/ros2_ws/src/g1pilot).
     # Eine Trigger-Datei hier ist fuer den Host-Watcher (start.sh) sichtbar.
@@ -721,6 +825,8 @@ class ButtonGUI(QWidget):
 
     def emergency_stop(self):
         """Turns all buttons OFF and publishes False to all Bool topics."""
+        self._estop_pressed = True
+        self.autostart.cancel("NOT-HALT")
 
         self.node.publish_bool(self.node.pub_start, False)
         self.node.publish_bool(self.node.pub_start_balancing, False)
@@ -728,7 +834,15 @@ class ButtonGUI(QWidget):
         self.node.publish_bool(self.node.pub_arms_enabled, False)
         self.node.publish_bool(self.node.pub_arms_home, False)
         self.node.publish_bool(self.node.pub_emergency_stop, True)
+        self._show_emergency_stop()
 
+    def _show_emergency_stop(self):
+        """Nur Anzeige: alle Buttons aus, EMERGENCY rot (auch bei NOT-HALT von
+        aussen, z.B. PS-Taste am Controller -- dann ohne erneutes Publizieren)."""
+        # Auch ein NOT-HALT von aussen beendet einen noch laufenden Sim-Auto-Start
+        # (sonst stellte ein wiederholtes BALANCING den Roboter wieder auf).
+        self._estop_pressed = True
+        self.autostart.cancel("NOT-HALT")
         for pos in self.buttons:
             if pos != (4, 4):
                 self.set_button_active(pos, False)
@@ -751,6 +865,7 @@ def main():
 
     app = QApplication(sys.argv)
     DarkStyle(app)
+    set_app_identity(app, "g1-streamdeck", "g1_streamdeck")  # eigenes Dock-Icon
     gui = ButtonGUI(node)
     gui.show()
 

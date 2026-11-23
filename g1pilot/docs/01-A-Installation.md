@@ -1,0 +1,316 @@
+# Installation & Ersteinrichtung — Anleitung
+
+Richtet sich an: alle Anwender. Ziel: von einem frischen Rechner zu einer
+laufenden Simulation.
+
+## Überblick
+
+G1Pilot läuft komplett in Docker. Auf dem Host wird nur Docker, Git und ein
+X11-Display gebraucht — der gesamte ROS-2-/MuJoCo-Stack steckt in den
+Container-Images. Das Repository ist eigenständig (keine Git-Submodule): die
+Unitree-Abhängigkeiten `unitree_mujoco`, `unitree_ros2`, `unitree_sdk2_python`
+liegen mit im Baum.
+
+Zwei Betriebsarten:
+
+- **Simulation** — MuJoCo-Physik statt echtem Roboter, läuft auf jedem
+  halbwegs aktuellen Rechner, keine GPU nötig.
+- **Echter Roboter** — siehe zusätzlich
+  [50-A-Echter-Roboter.md](50-A-Echter-Roboter.md), bevor der Stack
+  gegen Hardware gestartet wird.
+
+## Voraussetzungen
+
+- Linux (getestet auf Ubuntu 22.04 / 24.04) oder Windows 10/11 mit WSL2.
+- ≥ 8 GB RAM, ~10 GB freier Plattenplatz für die Docker-Images.
+- Ein laufendes X11-Display (für RViz und die MuJoCo-/Teleop-Fenster).
+  Unter Wayland hilft in der Regel `xhost` über den XWayland-Layer; über SSH
+  mit `ssh -X` verbinden.
+- Keine GPU/CUDA nötig — die Physik läuft auf der CPU. Für flüssige FPS
+  sollten MuJoCo-Viewer und RViz aber auf der GPU rendern (sonst CPU-Rendering
+  per `llvmpipe`, das der Physik die Kerne wegnimmt). Intel/AMD-Grafik geht
+  über `/dev/dri` automatisch. **Bei einer NVIDIA-Karte ist zusätzlich das
+  NVIDIA Container Toolkit nötig** — `start.sh` / `make sim` warnen, wenn es
+  fehlt; Prüfung jederzeit mit `make gpu-check`.
+
+## Schritt für Schritt (Linux)
+
+**1. System-Pakete**
+
+```bash
+sudo apt update
+sudo apt install -y git x11-xserver-utils ca-certificates curl \
+  python3-pyqt6 libqt6svg6 python3-venv
+```
+
+Diese Pakete laufen auf dem **Host**, nicht im Container:
+
+- `python3-pyqt6` + `libqt6svg6` — grafisches Startmenü von `./start.sh`
+  mit eingebautem Doku-Viewer (`libqt6svg6` zeigt die SVG-Bilder der Doku).
+  Fehlt PyQt6, bietet `start.sh` an, es selbst nachzuinstallieren
+  (Ubuntu 24.04 per apt, 22.04 per pip in `g1pilot/.venv-gui`; sonst Text-Menü).
+- `python3-venv` — virtualenv für den Umgebungs-Builder / Scene-Editor
+  (Schritt 5b). Ohne das Paket bricht `python3 -m venv` ab
+  (`No module named 'ensurepip'`) und hinterlässt ein kaputtes `.venv`
+  ohne `pip`.
+
+**2. Docker Engine + Compose-Plugin** (offizielles Docker-Repository)
+
+```bash
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+**3. Docker ohne `sudo` nutzbar machen**
+
+```bash
+sudo usermod -aG docker $USER
+newgrp docker          # oder: ab-/wieder anmelden
+docker run --rm hello-world   # muss ohne sudo durchlaufen
+```
+
+**4. Repository klonen**
+
+```bash
+git clone https://github.com/NilsMeier1812/G1.git
+cd G1/g1pilot
+```
+
+**5. Images bauen** (erstmalig, ca. 8 Minuten; lädt ROS 2 Humble, MuJoCo,
+Pinocchio usw.)
+
+```bash
+make build-sim         # baut g1pilot-sim:v1.1.0 + g1pilot-mujoco:v1.0
+```
+
+Für den **echten Roboter** stattdessen bzw. zusätzlich `make build-real`
+(~10 min, Image `g1pilot-real:v1.2.0`). Der komplette Ablauf vom frischen PC
+bis zur Demo-GUI am G1 steht in
+[50-A-Echter-Roboter.md](50-A-Echter-Roboter.md#kurzfassung-frischer-pc--demo-gui-am-echten-g1).
+
+**5b. Umgebungs-Builder / Scene-Editor einrichten** (einmalig, braucht
+Internet für PyPI)
+
+`start.sh` baut beim Auswählen einer Umgebung die Szene auf dem Host mit
+`unitree_mujoco/scene_editor/build_env_scene.py`. Das Skript nutzt dafür
+`trimesh` + `vhacdx` aus `scene_editor/.venv` (zerlegt Mesh-Hindernisse wie
+den Arbeitsplatz in konvexe Teil-Hüllen). Dasselbe venv braucht der
+Scene-Editor („Umgebungen bearbeiten").
+
+**Python-Version:** `mujoco-scene-editor` braucht Python **3.10–3.12**
+(Ubuntu 22.04: 3.10, 24.04: 3.12, beide ok). Ubuntu 26.04 bringt nur 3.14
+mit. Dann ein 3.12 ohne sudo per [uv](https://docs.astral.sh/uv/)
+installieren; `setup.sh` findet es automatisch:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+~/.local/bin/uv python install 3.12
+```
+
+```bash
+cd ../unitree_mujoco/scene_editor
+rm -rf .venv           # nur nötig, falls ein altes/kaputtes .venv existiert
+./setup.sh             # legt .venv an, installiert requirements.txt
+.venv/bin/python -c "import trimesh, vhacdx; print('ok')"   # muss 'ok' ausgeben
+cd ../../g1pilot
+```
+
+Fehlen die Pakete, gibt es **keine sichtbare Fehlermeldung**: die Szene wird
+mit nur einer konvexen Hülle pro Mesh gebaut, und Greif-Objekte werden beim
+Start weggeschleudert (ständige `[scene-reset]`-Meldungen im Log). Ein `.venv`
+nach dem Verschieben/Kopieren des Repos immer neu anlegen — virtualenvs
+enthalten absolute Pfade. Details:
+[unitree_mujoco/scene_editor/README.md](../../unitree_mujoco/scene_editor/README.md).
+
+**6. Starten**
+
+```bash
+make sim               # baut bei Bedarf nach und startet den Stack
+```
+
+Beim ersten `make sim` wird zusätzlich `xhost +local:docker` gesetzt, damit
+die Container auf das Display zugreifen dürfen. Erscheinen das MuJoCo-Fenster
+und die Demo-GUI, steht die Umgebung. Der Roboter steht dabei zunächst nur
+— siehe [30-A-Stehen-und-Gehen.md](30-A-Stehen-und-Gehen.md) für die Bedienung.
+
+## Windows (WSL2)
+
+Läuft auf Windows, aber **innerhalb von WSL2**, nicht über „Docker Desktop für
+Windows" pur. Zwei Dinge im Setup sind Linux-spezifisch: `network_mode: host`
+(trägt die DDS-Kommunikation der Container über `lo`) und die X11-GUIs (RViz
++ MuJoCo-Viewer). Beides funktioniert in WSL2 sauber, in Docker Desktop pur
+dagegen nicht zuverlässig. GPU/CUDA wird nicht gebraucht.
+
+Empfohlen: Windows 11 (WSLg für die GUIs ist eingebaut).
+
+```powershell
+# In PowerShell (als Administrator): WSL2 + Ubuntu installieren, dann neu starten
+wsl --install -d Ubuntu
+```
+
+Danach im Ubuntu-Terminal (WSL) weiter — ab hier identisch zur
+Linux-Anleitung oben:
+
+**Vorher: Netzwerk prüfen.** Mit aktivem VPN (z. B. eduVPN an der FAU) kommt
+WSL2 im Standard-Netzwerkmodus oft nicht ins Internet — siehe
+[WSL2-Netzwerk](#wsl2-netzwerk-vpn-uni-wlan-roboter) unten. Test:
+
+```bash
+curl -sI https://github.com | head -1    # erwartet: HTTP/2 200
+```
+
+```bash
+# System-Pakete inkl. python3-pyqt6 + python3-venv (Schritt 1 oben).
+# Docker-Engine NATIV in der WSL-Distro installieren (Schritte 1-3 oben).
+# Native Engine statt Docker-Desktop-Integration, damit Host-Networking
+# ohne Tricks funktioniert.
+sudo service docker start
+
+# Repo INS WSL-Dateisystem klonen (NICHT nach /mnt/c/... — das ist langsam)
+cd ~
+git clone https://github.com/NilsMeier1812/G1.git
+cd G1/g1pilot
+make build-sim
+# Umgebungs-Builder einrichten (Schritt 5b oben)
+(cd ../unitree_mujoco/scene_editor && ./setup.sh)
+make sim
+```
+
+WSLg setzt `DISPLAY` automatisch und stellt den X11-Socket bereit — das
+MuJoCo-Fenster und RViz öffnen sich direkt auf dem Windows-Desktop.
+
+Windows 10: geht ebenfalls über WSL2, aber WSLg ist nicht in jeder Version
+dabei — dann einen X-Server (VcXsrv/X410) starten und `DISPLAY` von Hand
+setzen. Docker Desktop statt nativer Engine ist möglich, `network_mode: host`
+ist dort aber nur als (zu aktivierendes) Beta-Feature neuerer Versionen
+verfügbar.
+
+### WSL2-Netzwerk (VPN, Uni-WLAN, Roboter)
+
+**Problem.** Im Standardmodus (NAT) hat WSL2 ein eigenes virtuelles Netz
+(`172.x.x.x`) hinter Windows. Der Datenverkehr läuft dabei oft **am
+VPN-Tunnel vorbei** direkt ins physische Netz. Im FAU-WLAN, das ohne VPN nur
+FAU-Server erreicht, sieht das so aus:
+
+| Ziel | Windows | WSL2 (NAT) |
+|---|---|---|
+| FAU-Server (`ftp.fau.de`, `gitlab.cs.fau.de`, …) | ✅ | ✅ |
+| Alles andere (`archive.ubuntu.com`, PyPI, GitHub, Docker Hub, `packages.ros.org`) | ✅ | ❌ Timeout |
+
+Betroffen sind damit `apt install`, `pip install` (auch `setup.sh`),
+`git clone` von GitHub, `docker pull` und `make build-sim`. `apt` meldet dann
+nur `Ign:` und bricht ab, `curl` läuft in einen Timeout. Außerdem liegt WSL
+im NAT-Modus nicht im selben Netz wie ein per Ethernet angeschlossener
+Roboter (`192.168.123.x`), und DDS-Multicast kommt nicht durch.
+
+Kurz-Diagnose:
+
+```bash
+# in WSL
+curl -4 -sS -m 8 -o /dev/null -w '%{http_code}\n' https://github.com   # 000 = blockiert
+curl -4 -sS -m 8 -o /dev/null -w '%{http_code}\n' https://ftp.fau.de   # 200 = nur Uni-Netz geht
+```
+
+```powershell
+# in PowerShell: kommt Windows selbst durch?
+Test-NetConnection github.com -Port 443
+```
+
+Windows kommt durch, WSL nicht? Dann ist es dieses Problem.
+
+**Lösung: Mirrored Networking** (Windows 11 22H2+, aktuelles WSL). WSL nutzt
+dann direkt die Netzwerkadapter von Windows, inklusive VPN-Tunnel und
+Roboter-Ethernet. Datei `C:\Users\<name>\.wslconfig` anlegen bzw. ergänzen:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=true
+autoProxy=true
+```
+
+Danach in PowerShell WSL neu starten und prüfen:
+
+```powershell
+wsl --shutdown
+```
+
+```bash
+# wieder in WSL
+curl -sI https://github.com | head -1    # erwartet: HTTP/2 200
+```
+
+Für DDS vom echten Roboter blockiert zusätzlich die Hyper-V-Firewall
+eingehende Pakete. Freigeben in einer **Administrator**-PowerShell:
+
+```powershell
+Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Allow
+```
+
+(Für den Echtbetrieb bleibt trotzdem ein nativer Linux-PC empfohlen, siehe
+[50-A-Echter-Roboter.md](50-A-Echter-Roboter.md).)
+
+**Wenn Mirrored Mode nicht hilft:**
+
+- **apt:** auf den FAU-Mirror umstellen, der auch ohne VPN erreichbar ist:
+
+  ```bash
+  sudo cp /etc/apt/sources.list.d/ubuntu.sources ~/ubuntu.sources.bak
+  sudo sed -i -e 's|http://archive.ubuntu.com/ubuntu/|http://ftp.fau.de/ubuntu/|' \
+              -e 's|http://security.ubuntu.com/ubuntu/|http://ftp.fau.de/ubuntu/|' \
+              /etc/apt/sources.list.d/ubuntu.sources
+  sudo apt update
+  ```
+
+  Zurück: `sudo cp ~/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources`.
+- **pip / Docker Hub / GitHub:** Dafür gibt es keinen FAU-Mirror. Einmalig in
+  einem freien Netz (eduroam, LAN, Handy-Hotspot, zu Hause) `make build-sim`
+  und `scene_editor/setup.sh` ausführen. Danach braucht die Simulation kein
+  Internet mehr.
+- **Proxy:** Falls das Institut einen HTTP-Proxy anbietet, diesen für apt
+  (`/etc/apt/apt.conf.d/`), pip (`HTTPS_PROXY`) und Docker
+  (`/etc/systemd/system/docker.service.d/`) eintragen.
+
+## Starten im Alltag
+
+```bash
+./start.sh            # grafisches Startmenü (Standard)
+./start.sh --menu     # klassisches Text-Menü
+make sim              # ohne Menü, Simulation mit Defaults
+```
+
+Das Startmenü (Simulation, Echter Roboter, Umgebungen, Dokumentation), alle
+Optionen, der Text-Modus und die `make`-/`docker compose`-Befehle stehen in
+[03-A-Startmenue.md](03-A-Startmenue.md). Alle Umgebungsvariablen:
+[04-T-Umgebungsvariablen.md](04-T-Umgebungsvariablen.md).
+
+## Nach dem Start: Dokumentation
+
+Alle weiteren Themen-Dokumente sind über [docs/README.md](README.md)
+erreichbar, sowie aus dem grafischen Startmenü über den Menüpunkt
+„Dokumentation".
+
+## Fehlerbehebung
+
+| Symptom | Ursache / Fix |
+|---|---|
+| `docker run --rm hello-world` verlangt `sudo` | Neu einloggen bzw. `newgrp docker` nach Schritt 3. |
+| Kein MuJoCo-/RViz-Fenster | `DISPLAY` gesetzt? `xhost +local:docker` gelaufen (macht `make`/`start.sh` automatisch)? |
+| Build bricht mit Netzwerkfehlern ab | Docker-Build lädt ROS-2-Pakete aus dem Internet — Firewall/Proxy prüfen. Unter WSL2 mit VPN: [WSL2-Netzwerk](#wsl2-netzwerk-vpn-uni-wlan-roboter). |
+| `apt install` hängt bei `Ign:` / `curl` Timeout (WSL2) | WSL kommt nicht am VPN vorbei ins Internet → [WSL2-Netzwerk](#wsl2-netzwerk-vpn-uni-wlan-roboter). |
+| `./start.sh` zeigt nur das Text-Menü | PyQt6 fehlt auf dem Host (`start.sh` sagt das): `sudo apt install python3-pyqt6 libqt6svg6`. |
+| `setup.sh`: `No matching distribution found for mujoco-scene-editor` / `Requires-Python <3.13` | Host-Python zu neu (Ubuntu 26.04: 3.14) → Python 3.12 per uv, siehe Schritt 5b. |
+| `setup.sh`: `No module named 'ensurepip'` | `sudo apt install python3-venv`, dann `rm -rf .venv && ./setup.sh`. |
+| Greif-Objekte fliegen weg, ständig `[scene-reset]` | `trimesh`/`vhacdx` fehlen im `scene_editor/.venv` → Schritt 5b. |
+| Sim läuft mit sehr wenigen FPS, Log zeigt `[gpu] WARNUNG: MuJoCo rendert auf der CPU (llvmpipe)` | Container hat keinen GPU-Zugriff. Häufigster Grund: NVIDIA-Karte ohne NVIDIA Container Toolkit. `make gpu-check` zeigt Ursache und Installationsbefehle; danach `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` und Sim neu starten. |
+| `make sim` baut jedes Mal neu | Normal, sofern sich Quellcode/Dockerfile geändert haben; Docker cached unveränderte Layer. |
+| Sim: Fenster öffnen sich, aber die Arme reagieren nicht | Der Auto-Start in GREIFEN wartet, bis arm_controller und loco_sim bereit sind (langsamer Rechner: einige Sekunden). Sonst in der Demo-GUI GREIFEN antippen, siehe [40-A-Simulation.md](40-A-Simulation.md#fehlerbehebung). |
+| Real: Fenster öffnen sich, der Roboter reagiert auf nichts | Gewollt: am echten G1 gibt es keinen Auto-Start. Erst »Start« in der Startleiste, siehe [50-A-Echter-Roboter.md](50-A-Echter-Roboter.md). |

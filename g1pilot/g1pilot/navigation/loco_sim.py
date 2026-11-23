@@ -46,7 +46,7 @@ ARME: loco_sim regelt sie NICHT. Sie gehoeren komplett dem arm_controller
 (rt/arm_sdk, via rviz/Marker). loco_sim schreibt nur Beine (0..11) + Taille
 (12..14) -> kein Arm-"Teleport" bei Zustandswechseln.
 
-FSM (per Streamdeck-Topics); der Zustand wird auch der Bridge gemeldet (Weld):
+FSM (per GUI-Topics); der Zustand wird auch der Bridge gemeldet (Weld):
   HOLD   : Standby. Bridge haelt die Basis (Weld an), Gelenke auf Default-Pose.
   STAND  : PD-Balancer (Basis frei, aufgestellt). Fuesse geplant.
   WALK   : ONNX-Policy (Basis frei). Geschwindigkeit via loco_cmd_vel.
@@ -273,7 +273,7 @@ class LocoSim(Node):
         # Aufladbarer Schubs: Ladegrad 0..1 beim Loslassen des PUSH-Buttons.
         self.create_subscription(Float32, "/g1pilot/push_charge", self._on_push_charge, 10)
 
-        # GRASP BOX: Streamdeck-Toggle -> UDP an die Sim (greifbare Test-Kugel an/aus).
+        # GRASP BOX: GUI-Schalter -> UDP an die Sim (greifbare Test-Kugel an/aus).
         self._grasp_port = int(os.environ.get("SIM_GRASP_PORT", "47901"))
         self._grasp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.create_subscription(Bool, "/g1pilot/grasp_box", self._on_grasp_box, 10)
@@ -330,10 +330,10 @@ class LocoSim(Node):
 
     def _load_com_model(self, path):
         if not path:
-            inspire = os.environ.get("G1_INSPIRE_HANDS", "0").strip().lower() in (
-                "1", "true", "yes", "on")
-            path = os.path.join("/unitree_mujoco/unitree_robots/g1",
-                                "g1_29dof_inspire_ftp.xml" if inspire else "g1_29dof.xml")
+            # Robotermodell zum Hand-Profil (G1_HANDS / G1_INSPIRE_HANDS),
+            # damit die Handmasse (Inspire / Rubber / Haken) im Schwerpunkt steckt.
+            from g1pilot.utils.hand_profile import mjcf_file_name
+            path = os.path.join("/unitree_mujoco/unitree_robots/g1", mjcf_file_name())
         self.com_model = None
         try:
             from g1pilot.navigation.com_model import ComModel
@@ -539,7 +539,7 @@ class LocoSim(Node):
             self.get_logger().warn(f"PUSH nicht gesendet: {e}")
 
     def _on_grasp_box(self, msg: Bool):
-        """Streamdeck-Toggle -> greifbare Test-Kugel in der Sim an/aus."""
+        """GUI-Schalter -> greifbare Test-Kugel in der Sim an/aus."""
         payload = b"on" if msg.data else b"off"
         try:
             self._grasp_sock.sendto(payload, ("127.0.0.1", self._grasp_port))

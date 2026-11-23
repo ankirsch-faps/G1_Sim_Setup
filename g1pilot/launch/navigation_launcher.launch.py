@@ -28,7 +28,7 @@ def generate_launch_description():
         DeclareLaunchArgument("ik_alpha", default_value="0.2"),
         DeclareLaunchArgument("ik_max_dq_step", default_value="0.05"),
         DeclareLaunchArgument("arm_velocity_limit", default_value="2.0"),
-        # Streamdeck-/PS4-Walk: Geschwindigkeits-Limits + Deadman-Timeout
+        # GUI-/PS4-Walk: Geschwindigkeits-Limits + Deadman-Timeout
         DeclareLaunchArgument("max_vx", default_value="0.4"),
         DeclareLaunchArgument("max_vy", default_value="0.3"),
         DeclareLaunchArgument("max_vyaw", default_value="0.4"),
@@ -81,7 +81,7 @@ def generate_launch_description():
 
         # Umgebungs-Objekte aus der MuJoCo-Sim (Hindernisse + Greif-Objekte)
         # -> /scene_markers. Quelle fuer create_map (/map) UND den IK-Solver
-        # (Umgebungs-Kollision, siehe arm_controller.py). Siehe g1pilot/docs/51_navigation_technik.md.
+        # (Umgebungs-Kollision, siehe arm_controller.py). Siehe g1pilot/docs/31-T-Navigation.md.
         Node(
             package='g1pilot',
             executable='scene_bridge',

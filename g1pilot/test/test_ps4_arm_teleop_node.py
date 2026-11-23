@@ -6,7 +6,8 @@ Ohne Roboter und ohne Controller: der Test spielt sensor_msgs/Joy ein, stellt
 die Hand-Frames per statischer TF bereit und prueft die Topics, die der Node
 an arm_controller / loco_client / Inspire-Bridge schickt:
 
-  - Options uebernimmt nur die Arme (KEIN start_balancing -> Beine unberuehrt),
+  - R2 uebernimmt nur die Arme (KEIN start_balancing -> Beine unberuehrt),
+  - Options sperrt den Controller (nur PS-Notaus wirkt), erneut = entsperrt,
   - Tempo startet Langsam, R1 endet bei Normal, Ziel-Vorlauf begrenzt,
   - NOT-HALT von aussen (GUI) sperrt den Controller (LED rot), START gibt frei,
   - PS sendet den NOT-HALT, Kreis/Viereck die Hand-Befehle,
@@ -194,11 +195,11 @@ def test_real_settings_end_to_end(rig):
     st = rig.status()
     assert st["speed"] == "Langsam" and st["selection"] == "right" and not st["estop"]
 
-    # Options: nur Arme uebernehmen, Beine unberuehrt
-    rig.press(L.OPTIONS)
+    # R2 (ohne trigger_modes): nur Arme uebernehmen, Beine unberuehrt
+    rig.press(L.R2)
     assert wait_for(lambda: any(m.data for _, m in g["enabled"]))
     time.sleep(0.3)
-    assert g["balance"] == [], "Options darf auf real kein start_balancing senden"
+    assert g["balance"] == [], "R2 darf auf real kein start_balancing senden"
 
     # Linker Stick vor -> rechte Hand-Ziele laufen +x, Vorlauf begrenzt (4 cm)
     t0 = time.monotonic()
@@ -636,3 +637,144 @@ def test_stick_during_sequence_motion_sends_no_goal(rig):
     rig.state["axes"][L.LY] = 0.6
     assert wait_for(lambda: goals_since(rig, "right", t1), 2.0)
     rig.state["axes"][L.LY] = 0.0
+
+
+# ── Options = Controller sperren (Ablegen) ───────────────────────────────
+@pytest.mark.parametrize("rig", [MODES], indirect=True)
+def test_options_lock_blocks_triggers_keeps_ps_estop(rig):
+    g, st = rig.got, rig.state
+    rig.onboard(501)
+    time.sleep(0.3)
+    rig.press(L.R2)                                     # GREIFEN
+    assert wait_for(lambda: rig.status().get("robot_mode") == "grasp", 2.0)
+    n_fb = len(g["feedback"])
+    rig.press(L.OPTIONS)
+    assert wait_for(lambda: rig.status().get("locked") is True, 2.0)
+    assert "GESPERRT" in rig.status()["label"]
+    time.sleep(0.2)
+    fbs = [json.loads(m.data) for _, m in g["feedback"][n_fb:]]
+    assert fbs[-1]["rgb"] == [40, 40, 40]
+    assert any((f.get("rumble") or {}).get("ms") == 400 for f in fbs)
+    # Ablegen: L2, R2, Stick, Kreis -> nichts
+    n = {k: len(g[k]) for k in ("goal_right", "enabled", "balance", "hand_right")}
+    st["axes"][L.L2_AXIS] = st["axes"][L.R2_AXIS] = 1.0
+    st["axes"][L.LY] = 1.0
+    time.sleep(0.5)
+    rig.press(L.CIRCLE)
+    st["axes"][L.L2_AXIS] = st["axes"][L.R2_AXIS] = st["axes"][L.LY] = 0.0
+    time.sleep(0.3)
+    assert {k: len(g[k]) for k in n} == n and _walk_bools(g) == []
+    taps = [json.loads(m.data).get("rumble") for _, m in g["feedback"][n_fb:]]
+    assert sum(1 for r in taps if r and r.get("ms") == 80 and r["weak"] == 0.3) >= 2
+    assert rig.status().get("robot_mode") == "grasp"
+    # Entsperren, dann wirkt der Controller wieder
+    rig.press(L.OPTIONS)
+    assert wait_for(lambda: rig.status().get("locked") is False, 2.0)
+    rig.press(L.CIRCLE)
+    assert wait_for(lambda: len(g["hand_right"]) == n["hand_right"] + 1, 2.0)
+    # Gesperrt: PS = NOT-HALT wirkt weiter
+    rig.press(L.OPTIONS)
+    assert wait_for(lambda: rig.status().get("locked") is True, 2.0)
+    n_estop = len(g["estop"])
+    rig.press(L.PS)
+    assert wait_for(lambda: len(g["estop"]) > n_estop, 2.0)
+    assert rig.status().get("estop") is True
+
+
+# ── Pose-Schnellwahl: R2 halten + Steuerkreuz zweimal, R2 los (2026-11-16) ──
+@pytest.fixture
+def qs_store(tmp_path, monkeypatch):
+    """Posen-Datei fuer den Node-Prozess (vor `rig` anfordern: Umgebung wird
+    beim Start des Nodes kopiert)."""
+    from g1pilot.manipulation.pose_store import PoseStore
+    path = tmp_path / "poses.json"
+    monkeypatch.setenv("G1_POSE_STORE", str(path))
+    store = PoseStore(path)
+    store.save("Greifen", left_arm=[0.0] * 7)
+    store.set_quickslot("down-up", "Greifen")
+    return store
+
+
+@pytest.mark.parametrize("rig", [MODES], indirect=True)
+def test_quickslot_goto_on_r2_release(qs_store, rig):
+    g, st = rig.got, rig.state
+    node = rclpy.create_node("ps4_quick_probe")
+    gotos = []
+    node.create_subscription(String, "/g1pilot/pose_store/goto",
+                             lambda m: gotos.append(m.data), 10)
+    ex = rclpy.executors.SingleThreadedExecutor()
+    ex.add_node(node)
+    th = threading.Thread(target=ex.spin, daemon=True)
+    th.start()
+    rumbles = lambda n: [json.loads(m.data).get("rumble") for _, m in g["feedback"][n:]]  # noqa: E731
+    try:
+        rig.onboard(501)
+        time.sleep(0.3)
+        rig.press(L.R2)                                     # GREIFEN
+        assert wait_for(lambda: rig.status().get("robot_mode") == "grasp", 2.0)
+        st["axes"][L.R2_AXIS] = 1.0
+        assert wait_for(lambda: rig.status().get("waist_mode") is True, 2.0)
+        rig.press(L.DPAD_DOWN)
+        assert wait_for(lambda: (rig.status().get("quick") or {}).get("first") == "down", 2.0)
+        n = len(g["feedback"])
+        rig.press(L.DPAD_UP)
+        assert wait_for(lambda: (rig.status().get("quick") or {}).get("name") == "Greifen", 2.0)
+        assert any(r and r["ms"] >= 200 for r in rumbles(n)), "Platz gewaehlt vibriert"
+        assert rig.status().get("selection") == "right"     # keine Hand-Auswahl
+        time.sleep(0.5)
+        assert gotos == [], "faehrt erst beim Loslassen"
+        st["axes"][L.R2_AXIS] = 0.0                         # R2 los
+        assert wait_for(lambda: gotos == ["Greifen"], 2.0)
+        assert wait_for(lambda: rig.status().get("qs_busy") is True, 2.0)
+        t0 = time.monotonic()
+        st["axes"][L.LY] = 0.8                              # Stick waehrend der Fahrt
+        time.sleep(0.6)
+        st["axes"][L.LY] = 0.0
+        assert goals_since(rig, "right", t0) == []
+        rig.cmd_status(id="", state="accepted", source="pose_store")
+        rig.cmd_status(id="", state="reached", source="pose_store")
+        assert wait_for(lambda: rig.status().get("qs_busy") is False, 2.0)
+        # leerer Platz: nichts faehrt, lange harte Vibration
+        st["axes"][L.R2_AXIS] = 1.0
+        assert wait_for(lambda: rig.status().get("waist_mode") is True, 2.0)
+        rig.press(L.DPAD_LEFT)
+        rig.press(L.DPAD_LEFT)
+        n = len(g["feedback"])
+        st["axes"][L.R2_AXIS] = 0.0
+        assert wait_for(lambda: any(r and r["ms"] >= 600 for r in rumbles(n)), 2.0)
+        time.sleep(0.3)
+        assert gotos == ["Greifen"]
+        # Kreuz verwirft vor dem Loslassen
+        st["axes"][L.R2_AXIS] = 1.0
+        assert wait_for(lambda: rig.status().get("waist_mode") is True, 2.0)
+        rig.press(L.DPAD_DOWN)
+        rig.press(L.DPAD_UP)
+        rig.press(L.CROSS)
+        st["axes"][L.R2_AXIS] = 0.0
+        time.sleep(0.5)
+        assert gotos == ["Greifen"]
+    finally:
+        st["axes"][L.R2_AXIS] = 0.0
+        ex.shutdown()
+        th.join(timeout=2.0)
+        node.destroy_node()
+
+
+@pytest.mark.parametrize("rig", [MODES], indirect=True)
+def test_quickslot_rejected_rumbles_and_frees_sticks(qs_store, rig):
+    g, st = rig.got, rig.state
+    rumbles = lambda n: [json.loads(m.data).get("rumble") for _, m in g["feedback"][n:]]  # noqa: E731
+    rig.onboard(501)
+    time.sleep(0.3)
+    rig.press(L.R2)
+    assert wait_for(lambda: rig.status().get("robot_mode") == "grasp", 2.0)
+    st["axes"][L.R2_AXIS] = 1.0
+    assert wait_for(lambda: rig.status().get("waist_mode") is True, 2.0)
+    rig.press(L.DPAD_DOWN)
+    rig.press(L.DPAD_UP)
+    st["axes"][L.R2_AXIS] = 0.0
+    assert wait_for(lambda: rig.status().get("qs_busy") is True, 2.0)
+    n = len(g["feedback"])
+    rig.cmd_status(id="", state="rejected", source="pose_store", reason="Arme nicht aktiviert")
+    assert wait_for(lambda: rig.status().get("qs_busy") is False, 2.0)
+    assert any(r and r["ms"] >= 600 for r in rumbles(n))

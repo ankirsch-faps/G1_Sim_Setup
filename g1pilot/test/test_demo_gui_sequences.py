@@ -140,7 +140,7 @@ def test_waiting_sequence_ends_and_never_resumes(gui, how):
     if how == "estop_gui":
         g.emergency_stop()
     elif how == "estop_extern":
-        g._external_estop()                                  # PS am Controller, Handy, Streamdeck
+        g._external_estop()                                  # PS am Controller, Handy
     elif how == "stop":
         g._cancel()
     elif how == "controller_cross":
@@ -275,7 +275,8 @@ def test_editor_relative_moves(gui, monkeypatch):
     ed._select_item({"move": "Box anheben"})
     ed.btn_add.click()
     assert store.get_sequence("Kiste")[1] == {"move": "Box anheben", "wait_s": 0.0}
-    assert "↕ Box anheben" in ed.step_list.item(1).text()
+    assert "2. Box anheben" in ed.step_list.item(1).text()
+    assert not ed.step_list.item(1).icon().isNull()      # Icon statt Emoji
     # Umbenennen ueber »Bearbeiten …« zieht den Schritt mit
     def rename(dlg):
         assert dlg.spins["dz"].value() == pytest.approx(5.0)
@@ -284,10 +285,10 @@ def test_editor_relative_moves(gui, monkeypatch):
     monkeypatch.setattr(se.MoveDialog, "exec", rename)
     ed.btn_edit_move.click()
     assert store.get_sequence("Kiste")[1]["move"] == "Anheben"
-    assert "↕ Anheben" in ed.step_list.item(1).text()
+    assert "2. Anheben" in ed.step_list.item(1).text()
     # Ungueltig (0 cm) -> Dialog meldet und bleibt offen
     warned = []
-    monkeypatch.setattr(se.QMessageBox, "warning", lambda *a: warned.append(a[2]))
+    monkeypatch.setattr(se.msgbox, "warn", lambda *a: warned.append(a[2]))
     dlg = se.MoveDialog(ed, "Nichts", {"dx": 0, "dy": 0, "dz": 0, "sides": ["left"]})
     dlg._accept()
     assert warned and dlg.result()[0] == "Nichts"
@@ -342,7 +343,7 @@ def test_editor_compose_reorder_wait(gui):
 
 def test_teach_in_appends_after_save_ack(gui, monkeypatch):
     dg, g, node, sent, strs, states, store = gui
-    from g1pilot.teleoperation import ui_interface as ui
+    from g1pilot.teleoperation import gui_base as ui
     seen = {}
 
     class FakeDialog:
@@ -394,10 +395,10 @@ def test_save_failure_reported(gui, monkeypatch):
 
 def test_save_dialog_sequence_field():
     app = QApplication.instance() or QApplication([])   # noqa: F841
-    from g1pilot.teleoperation.ui_interface import PoseSaveDialog
+    from g1pilot.teleoperation.gui_base import PoseSaveDialog
     d = PoseSaveDialog(None, categories=["Demo"])
     d.ed_name.setText("A")
-    assert "sequence" not in d.result_data()                 # Streamdeck unveraendert
+    assert "sequence" not in d.result_data()                 # ohne Ablauf unveraendert
     d = PoseSaveDialog(None, categories=["Demo"], sequences=["Kiste"], sequence="Kiste")
     d.ed_name.setText("A")
     assert d.result_data()["sequence"] == "Kiste"
@@ -405,3 +406,84 @@ def test_save_dialog_sequence_field():
     assert d.result_data()["sequence"] is None
     d.cb_sequence.setCurrentText("Ganz neu")
     assert d.result_data()["sequence"] == "Ganz neu"
+
+
+# ── Controller-Schnellwahl: Reiter im Fenster »Posen & Abläufe« ─────────────
+def test_editor_quickslot_grid_assign_highlight(gui):
+    dg, g, node, sent, strs, states, store = gui
+    g.open_sequence_editor()
+    ed = g.seq_editor
+    assert ed.tabs.count() == 2 and "Schnellwahl" in ed.tabs.tabText(1)
+    panel = ed.quick
+    assert len(panel.cells) == 16 and set(panel.rows) == {"up", "down", "left", "right"}
+    cell = panel.cells["down-up"]
+    assert cell.current() is None and cell.property("state") == "empty"
+    # Kategorie-Zeilen sind nicht waehlbar, Posen schon
+    names = [cell.box.itemData(i) for i in range(cell.box.count())]
+    assert {"Sichere_Pose", "Hand_vor", "Greifen"} <= set(names)
+    cell.box.setCurrentIndex(cell.box.findData("Greifen"))
+    assert store.quickslot("down-up") == "Greifen"
+    assert panel.cells["down-up"].property("state") == "set"
+    assert "1 von 16" in panel.status.text()
+    # leeren
+    panel.cells["down-up"].box.setCurrentIndex(0)
+    assert store.quickslot("down-up") is None
+    # geloeschte Pose: rot "(fehlt)"
+    store.set_quickslot("left-left", "Hand_vor")
+    store.delete("Hand_vor")
+    ed.reload()
+    c2 = panel.cells["left-left"]
+    assert c2.property("state") == "missing" and "(fehlt)" in c2.box.currentText()
+    # Controller waehlt gerade: Zeile, dann Feld leuchten
+    panel.highlight({"first": "left", "combo": None})
+    assert all(c.property("state") == "row" for c in panel.rows["left"])
+    assert panel.cells["up-up"].property("state") == "empty"
+    panel.highlight({"first": "left", "combo": "left-left"})
+    assert c2.property("state") == "live"
+    assert panel.cells["left-up"].property("state") == "empty"
+    panel.highlight(None)
+    assert c2.property("state") == "missing"
+
+
+def test_gui_shows_controller_quickslot_in_status(gui):
+    import time as _t
+    dg, g, node, sent, strs, states, store = gui
+    g.open_sequence_editor()
+    node.ps4 = {"selection": "right", "mode": "move", "speed": "Normal", "connected": True,
+                "waist_mode": True, "quick": {"first": "down", "combo": "down-up",
+                                              "name": "Greifen"}}
+    node.ps4_t = _t.monotonic()
+    g._refresh_info()
+    assert "↓↑ = »Greifen«" in g.status.text()
+    assert g.seq_editor.quick.cells["down-up"].property("state") == "live"
+    g.status.setText("anderes")
+    g._refresh_info()                         # unveraendert: Statuszeile bleibt
+    assert g.status.text() == "anderes"
+
+
+def test_pose_search_filters_editor_and_load_dialog(gui):
+    dg, g, node, sent, strs, states, store = gui
+    g.open_sequence_editor()
+    ed = g.seq_editor
+
+    def visible(tree):
+        return [tree.topLevelItem(i).child(j).text(0)
+                for i in range(tree.topLevelItemCount())
+                if not tree.topLevelItem(i).isHidden()
+                for j in range(tree.topLevelItem(i).childCount())
+                if not tree.topLevelItem(i).child(j).isHidden()]
+    ed.pose_search.setText("greif")
+    assert [t.split("   ")[0] for t in visible(ed.pose_tree)] == ["Greifen"]
+    ed.reload()                                   # Filter bleibt beim Neuladen
+    assert [t.split("   ")[0] for t in visible(ed.pose_tree)] == ["Greifen"]
+    ed.pose_search.setText("")
+    assert len(visible(ed.pose_tree)) >= 3
+    from PyQt6.QtCore import Qt
+    from g1pilot.teleoperation.gui_base import PoseLoadDialog
+    d = PoseLoadDialog(None, store.list_grouped(), components_of=store.components)
+    assert not d.btn_ok.isEnabled()
+    d.search.setText("hand")
+    assert visible(d.tree) == ["Hand_vor"]
+    hit = d.tree.findItems("Hand_vor", Qt.MatchFlag.MatchRecursive)[0]
+    d.tree.setCurrentItem(hit)
+    assert d.btn_ok.isEnabled()

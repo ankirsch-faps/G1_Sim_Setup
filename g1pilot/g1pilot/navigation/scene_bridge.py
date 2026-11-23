@@ -6,7 +6,7 @@ Objekte) vom MuJoCo-Container per UDP (siehe unitree_mujoco/simulate_python/
 scene_state_publisher.py, der Sender) und veroeffentlicht sie als
 visualization_msgs/MarkerArray auf /scene_markers.
 
-/scene_markers ist das EINE geteilte Weltmodell (siehe g1pilot/docs/51_navigation_technik.md):
+/scene_markers ist das EINE geteilte Weltmodell (siehe g1pilot/docs/31-T-Navigation.md):
   - RViz zeigt es direkt an (MarkerArray-Display in nav.rviz).
   - create_map.py rastert daraus die 2D-Hindernis-/Nav-Karte (/map).
   - arm_controller.py/ik_solver.py speisen daraus die Umgebungs-Kollision
@@ -66,7 +66,7 @@ class SceneBridge(Node):
 
         self.timer = self.create_timer(1.0 / rate if rate > 0 else 0.1, self._publish)
 
-        # RESET SCENE (Streamdeck): bewegliche Umgebungs-Objekte in der Sim auf
+        # RESET SCENE (GUI): bewegliche Umgebungs-Objekte in der Sim auf
         # ihre Startpose zuruecksetzen, Roboter bleibt. Der MuJoCo-Container hat
         # kein ROS -> UDP an scene_reset.py (Port MUSS zu SCENE_RESET_PORT passen).
         self.declare_parameter("reset_udp_port", 47903)

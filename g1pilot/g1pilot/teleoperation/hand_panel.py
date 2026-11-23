@@ -3,8 +3,8 @@
 """
 hand_panel — Handsteuerung der Demo-GUI (Inspire RH56DFTP-2, Sim UND real).
 
-Qt-Ersatz fuer die beiden Browser-GUIs der Hand-Bridge (hand_controller_viewer
-und inspire_hand_viewer). Zwei Ebenen, damit es im Demo-Betrieb einfach bleibt:
+Ersetzt die frueheren Browser-GUIs der Hand-Bridge (hand_controller_viewer und
+inspire_hand_viewer, 2026-11-04 entfernt). Zwei Ebenen, damit es im Demo-Betrieb einfach bleibt:
 
   * GANZE HAND: Beide/Links/Rechts oeffnen + schliessen.
   * FINGER: je Finger Soll-Schieber, Ist-Oeffnung und gemessene Kraft, dazu
@@ -13,8 +13,8 @@ und inspire_hand_viewer). Zwei Ebenen, damit es im Demo-Betrieb einfach bleibt:
     nullen. Die Griffkraft setzt das Kraft-Limit aller Finger.
 
 Kommunikation ausschliesslich ueber ROS (siehe inspire_ftp/bridge.py):
-  /g1pilot/hand_action/{left,right}  String "open"/"close" (wie Streamdeck)
-  /g1pilot/hand_cmd                  String JSON, gleiche Befehle wie ws://…:8766
+  /g1pilot/hand_action/{left,right}  String "open"/"close" (wie loco_client)
+  /g1pilot/hand_cmd                  String JSON (set_angle, set_force, open_hand, …)
   /g1pilot/hand_status               String JSON, ~10 Hz Ist-/Soll-Zustand + Zonen
 """
 
@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QRectF, QTimer
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
+
+from g1pilot.utils import ui_icons
 
 SIDES = ("left", "right")
 SIDE_TITLE = {"left": "LINKE HAND", "right": "RECHTE HAND"}
@@ -46,7 +48,7 @@ USER_HOLD_S = 1.0
 # Kein hand_status seit ... -> Bridge gilt als nicht erreichbar.
 STALE_S = 1.5
 
-# Taktil-Normierung wie inspire_hand_viewer.html: Delta zur Nulllage, Rauschen
+# Taktil-Normierung wie in der frueheren Browser-GUI inspire_hand_viewer.html: Delta zur Nulllage, Rauschen
 # weg, 1200 ADC-Einheiten = voller Ausschlag.
 TACTILE_NOISE = 80
 TACTILE_FULL = 1200
@@ -89,23 +91,23 @@ def heat_color(v):
     return QColor(*_HEAT[-1][1])
 
 
-def _btn(text, color="#2d2d2d", font=16, height=56, checkable=False):
+def _btn(text, color="#272d38", font=16, height=56, checkable=False):
     b = QPushButton(text)
     b.setMinimumHeight(height)
     b.setCheckable(checkable)
     b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     b.setStyleSheet(f"""
         QPushButton {{ background:{color}; color:white; font-size:{font}px; font-weight:700;
-                       border:1px solid #555; border-radius:12px; padding:4px 10px; }}
-        QPushButton:hover {{ border:2px solid #aaa; }}
-        QPushButton:pressed {{ background:#555; }}
+                       border:1px solid #3a4250; border-radius:12px; padding:4px 10px; }}
+        QPushButton:hover {{ border:2px solid #8f97a3; }}
+        QPushButton:pressed {{ background:#3a4250; }}
         QPushButton:checked {{ background:#fb8c00; border:2px solid #ffcc80; }}
-        QPushButton:disabled {{ background:#1c1c1c; color:#555; border:1px solid #2a2a2a; }}
+        QPushButton:disabled {{ background:#1f242d; color:#5d6470; border:1px solid #272d38; }}
     """)
     return b
 
 
-def _caption(text, size=14, color="#aaa"):
+def _caption(text, size=14, color="#8f97a3"):
     lbl = QLabel(text)
     lbl.setStyleSheet(f"color:{color}; font-size:{size}px; background:transparent;")
     return lbl
@@ -166,7 +168,7 @@ class FingerControl(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 0, 2, 0)
         lay.setSpacing(4)
-        title = _caption(name, 13, "#ddd")
+        title = _caption(name, 13, "#e8eaed")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setMinimumHeight(30)
         lay.addWidget(title)
@@ -263,7 +265,12 @@ class HandCard(QFrame):
         title.setStyleSheet(title.styleSheet() + "font-weight:800;")
         head.setSpacing(8)
         head.addWidget(title)
-        self.conn = _caption("● –", 12, "#666")
+        # Verbindungs-Punkt (gemalt, kein Emoji) + Text
+        self.conn_dot = QLabel()
+        self.conn_dot.setFixedSize(9, 9)
+        self._set_dot("#6b7380")
+        head.addWidget(self.conn_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.conn = _caption("–", 12, "#6b7380")
         head.addWidget(self.conn)
         head.addStretch(1)
         self.btn_open = _btn("Öffnen", "#2e7d32", font=15, height=44)
@@ -281,7 +288,7 @@ class HandCard(QFrame):
         self.tactile = TactileHand(side)
         zone_box = QVBoxLayout()
         zone_box.setSpacing(2)
-        zl = _caption("Kraftzonen", 12, "#777")
+        zl = _caption("Kraftzonen", 12, "#6b7380")
         zl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         zone_box.addWidget(zl)
         zone_box.addWidget(self.tactile, 1)
@@ -315,16 +322,19 @@ class HandCard(QFrame):
         for i, fc in self.fingers.items():
             fc.set_target(MAX_ANGLE if action == "open" else CLOSED[i], user=True)
 
+    def _set_dot(self, color):
+        self.conn_dot.setStyleSheet(f"background:{color}; border-radius:4px; border:none;")
+
     def set_connected(self, online, real=None):
         if not online:
-            self.conn.setText("● keine Daten")
-            self.conn.setStyleSheet("color:#ef5350; font-size:12px; background:transparent;")
+            text, color = "keine Daten", "#ef5350"
         elif real is False:
-            self.conn.setText("● nicht verbunden")
-            self.conn.setStyleSheet("color:#ffb300; font-size:12px; background:transparent;")
+            text, color = "nicht verbunden", "#ffb300"
         else:
-            self.conn.setText("● verbunden")
-            self.conn.setStyleSheet("color:#66bb6a; font-size:12px; background:transparent;")
+            text, color = "verbunden", "#66bb6a"
+        self.conn.setText(text)
+        self.conn.setStyleSheet(f"color:{color}; font-size:12px; background:transparent;")
+        self._set_dot(color)
 
     def update_state(self, st, baseline):
         aa, as_ = st.get("angle_act", []), st.get("angle_set", [])
@@ -385,9 +395,10 @@ class HandPanel(QWidget):
         lay.addLayout(hands, 1)
 
         # Erweitert (eingeklappt): Griffkraft, Tempo, Kraftzonen nullen
-        self.btn_expert = QPushButton("Erweitert ▸")
+        self.btn_expert = QPushButton("Erweitert")
+        ui_icons.set_icon(self.btn_expert, "chevron-right", "#8f97a3", 16)
         self.btn_expert.setCheckable(True)
-        self.btn_expert.setStyleSheet("QPushButton{background:transparent;color:#888;"
+        self.btn_expert.setStyleSheet("QPushButton{background:transparent;color:#8f97a3;"
                                       "border:none;font-size:14px;text-align:left;}")
         self.btn_expert.toggled.connect(self._toggle_expert)
         lay.addWidget(self.btn_expert)
@@ -428,10 +439,10 @@ class HandPanel(QWidget):
         box.setMinimumHeight(40)
         box.setMinimumWidth(170)
         box.setStyleSheet("""
-            QComboBox { background:#2d2d2d; color:white; font-size:14px; font-weight:700;
-                        border:1px solid #555; border-radius:10px; padding:4px 12px; }
-            QComboBox:hover { border:2px solid #aaa; }
-            QComboBox QAbstractItemView { background:#2d2d2d; color:white;
+            QComboBox { background:#272d38; color:white; font-size:14px; font-weight:700;
+                        border:1px solid #3a4250; border-radius:10px; padding:4px 12px; }
+            QComboBox:hover { border:2px solid #8f97a3; }
+            QComboBox QAbstractItemView { background:#272d38; color:white;
                                           selection-background-color:#fb8c00; }
         """)
         box.activated.connect(lambda i: cb(box.itemData(i)))
@@ -439,7 +450,8 @@ class HandPanel(QWidget):
 
     def _toggle_expert(self, on):
         self.expert.setVisible(on)
-        self.btn_expert.setText("Erweitert ▾" if on else "Erweitert ▸")
+        ui_icons.set_icon(self.btn_expert, "chevron-down" if on else "chevron-right",
+                          "#8f97a3", 16)
 
     # ── Befehle ─────────────────────────────────────────────────────────
     def _cmd(self, **cmd):

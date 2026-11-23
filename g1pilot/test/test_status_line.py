@@ -153,7 +153,7 @@ def test_start_walk_button_follows_ground_contact():
     st = {"fsm": 500, "walk_fsm": 501, "fsm_mode": None}
     assert sl.start_buttons(st, 0.1)["walk"] == (True, True)
     assert sl.walk_button_label(st, 0.1) == "Walk"
-    assert sl.walk_button_label(ok, 0.1) == "Walk\nBodenkontakt ✓"
+    assert sl.walk_button_label(ok, 0.1) == "Walk\nBodenkontakt ok"
     assert sl.walk_button_label(no, 0.1) == "Walk\nkein Bodenkontakt"
     assert sl.walk_button_label(unk, 0.1) == "Walk"
     assert sl.walk_button_label(no, 10.0) == "Walk"               # veraltet
@@ -162,7 +162,7 @@ def test_start_walk_button_follows_ground_contact():
 
 def test_onboard_text_shows_ground_contact():
     t, c = sl.onboard_text({"fsm": 4, "name": "Preparation", "fsm_mode": 0}, 0.1)
-    assert t == "G1: Preparation (FSM 4) · Bodenkontakt ✓ (FSM-Mode 0) – »Walk« möglich" and c == sl.GREEN
+    assert t == "G1: Preparation (FSM 4) · Bodenkontakt ok (FSM-Mode 0) – »Walk« möglich" and c == sl.GREEN
     t, c = sl.onboard_text({"fsm": 4, "name": "Preparation", "fsm_mode": 2}, 0.1)
     assert "kein Bodenkontakt (FSM-Mode 2)" in t and "gesperrt" in t and c == sl.RED
     t, c = sl.onboard_text({"fsm": 4, "name": "Preparation"}, 0.1)
@@ -178,7 +178,7 @@ def test_walk_tile_hint():
     assert sl.walk_tile_hint({"fsm": 501}, 10.0) == "gesperrt · keine Daten vom G1"
     assert sl.walk_tile_hint({"fsm": 501}, 0.1) is None          # GEHEN geht
     assert sl.walk_tile_hint({"fsm": 500}, 0.1) is None
-    assert sl.walk_tile_hint({"fsm": 4, "fsm_mode": 0}, 0.1) == "erst »Walk« · Bodenkontakt ✓"
+    assert sl.walk_tile_hint({"fsm": 4, "fsm_mode": 0}, 0.1) == "erst »Walk« · Bodenkontakt ok"
     assert sl.walk_tile_hint({"fsm": 4, "fsm_mode": 2}, 0.1) == "gesperrt · kein Bodenkontakt"
     assert sl.walk_tile_hint({"fsm": 4}, 0.1) == "erst »Walk« (Startleiste)"
     assert sl.walk_tile_hint({"fsm": 1}, 0.1) == "gesperrt · G1 nicht im Walk"
@@ -196,10 +196,50 @@ def test_ground_from_knee_load_field():
     t, c = sl.onboard_text(hang, 0.1)
     assert "kein Bodenkontakt (Knie-Last 0.3/0.2 Nm" in t and c == sl.RED
     t, c = sl.onboard_text(stand, 0.1)
-    assert "Bodenkontakt ✓ (Knie-Last 6.6/6.5 Nm) – »Walk« möglich" in t and c == sl.GREEN
+    assert "Bodenkontakt ok (Knie-Last 6.6/6.5 Nm) – »Walk« möglich" in t and c == sl.GREEN
     assert sl.walk_button_label(hang, 0.1) == "Walk\nkein Bodenkontakt"
     assert sl.walk_tile_hint(hang, 0.1) == "gesperrt · kein Bodenkontakt"
     # nicht messbar -> ebenfalls gesperrt
     nm = dict(hang, ground_why="Knie-Last nicht messbar (keine rt/lowstate)")
     assert not sl.start_buttons(nm, 0.1)["walk"][0]
     assert "nicht messbar" in sl.onboard_text(nm, 0.1)[0]
+
+
+def test_ps4_text_locked():
+    st = {"connected": True, "locked": True, "selection": "right"}
+    text, color = sl.ps4_text(st, 0.1)
+    assert "GESPERRT" in text and "Options" in text and color == sl.GREY
+    text, _ = sl.ps4_text(st, 0.1, device={"kind": "xbox"})
+    assert text.startswith("Xbox") and "Menu" in text
+    # NOT-HALT hat Vorrang vor der Sperre
+    assert "NOT-HALT" in sl.ps4_text(dict(st, estop=True), 0.1)[0]
+    assert "sperren" in dict(sl.ps4_help())["Options"]
+
+
+def test_ps4_help_groups_cover_every_key():
+    """Belegungs-Fenster: jede Taste genau einmal, PS-Text folgt ps_estop."""
+    for st in (None, {"ps_estop": False}):
+        groups = sl.ps4_help_groups(st)
+        rows = [r for _t, _i, _c, g in groups for r in g]
+        assert sorted(rows) == sorted(sl.ps4_help(st))
+        assert all(icon for _t, icon, _c, _g in groups)
+    assert [t for t, *_ in sl.ps4_help_groups()][-1] == "Sicherheit"   # nichts unter »Weitere«
+
+
+def test_ps4_quickslot_texts_and_help():
+    base = {"selection": "right", "mode": "move", "speed": "Normal", "connected": True,
+            "waist_mode": True}
+    t, _ = sl.ps4_text(dict(base, quick={"first": "down", "combo": None}), 0.1)
+    assert "SCHNELLWAHL ↓" in t and "zweite Richtung" in t
+    t, c = sl.ps4_text(dict(base, quick={"first": "down", "combo": "down-up",
+                                         "name": "Greifen"}), 0.1)
+    assert "↓↑ = »Greifen«" in t and "R2 loslassen" in t and c == sl.GREEN
+    t, c = sl.ps4_text(dict(base, quick={"first": "left", "combo": "left-left"}), 0.1)
+    assert "leer" in t and c == sl.AMBER
+    t, _ = sl.ps4_text(dict(base, quick=None), 0.1)
+    assert "HÜFTE" in t
+    t, _ = sl.ps4_text(dict(base, waist_mode=False, qs_busy=True), 0.1)
+    assert "SCHNELLWAHL-POSE fährt" in t
+    keys = [k for _, _, _, rows in sl.ps4_help_groups() for k, _ in rows]
+    assert any("Steuerkreuz 2×" in k for k in keys)
+    assert all(title != "Weitere" for title, *_ in sl.ps4_help_groups())

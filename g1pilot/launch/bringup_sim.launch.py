@@ -2,12 +2,11 @@
 bringup_sim.launch.py
 Startet G1Pilot für MuJoCo-Simulation.
 
-Unterschied zu bringup_launcher.launch.py:
+Aufbau:
   - robot_state + arm_controller: use_robot=true, interface=lo
     → kommunizieren über DDS Loopback mit MuJoCo
   - loco_sim: RL-Policy-Loco-/Balance-Controller (ersetzt das Unitree-Onboard-
     High-Level, das es in MuJoCo nicht gibt) → rt/lowstate→Policy→rt/lowcmd
-  - KEIN livox, KEIN mola (nicht nötig im Sim)
 """
 from launch import LaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -17,6 +16,7 @@ from launch.actions import IncludeLaunchDescription
 import os
 
 from g1pilot.navigation.walk_policy import policy_needs_arm_pose
+from g1pilot.utils.hand_profile import inspire_active
 
 def generate_launch_description():
     pkg_share = FindPackageShare('g1pilot').find('g1pilot')
@@ -34,20 +34,22 @@ def generate_launch_description():
     #  Bridge (HTML-GUIs + DDS rt/inspire/cmd|state, backend='mujoco'). robot_state
     #  gibt die Finger dann an die Bridge ab (publish_hand_joints=false), sonst gaebe
     #  es zwei /joint_states-Quellen fuer dieselben Gelenke.
-    inspire_hands = os.environ.get('G1_INSPIRE_HANDS', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+    #  G1_HANDS (inspire | rubber | eigenes Profil, z. B. haken) gewinnt vor
+    #  G1_INSPIRE_HANDS; eigene Profile sind starr -> keine Bridge, Finger aus.
+    inspire_hands = inspire_active()
 
     #  G1_ENABLE_NAV : "1"/"0" — den g1pilot-Nav-Stack (dijkstra_planner + nav2point)
     #  in der Sim mitstarten. Ersetzt die auf real fehlenden Bausteine durch Sim-Glue:
     #  sim_localization (Pose aus rt/sportmodestate statt MOLA) + joy_to_cmdvel
-    #  (Joy->loco_cmd_vel, weil loco_sim keinen Joy liest). Real laeuft derselbe
-    #  Nav-Stack ueber bringup_real (G1_ENABLE_LIDAR=1) mit MOLA + loco_client.
+    #  (Joy->loco_cmd_vel, weil loco_sim keinen Joy liest). Navigation gibt es
+    #  nur in der Sim (LiDAR/MOLA fuer den echten G1 wurde verworfen).
     enable_nav = os.environ.get('G1_ENABLE_NAV', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
     #  G1_WALK_POLICY : Lauf-Policy von loco_sim (Ordner unter policies/), im
     #  Startmenue waehlbar. g1_wholebody (Default, alte Policy, Arme beim Laufen
     #  in der Lauf-Pose) | agile_velocity_g1 (sehr robust, Gang mit Fangschritten,
     #  Arme frei) | agile_velocity_height_g1 (gleichmaessiger Gang, Arme frei).
-    #  Siehe docs/31_loco_technik.md.
+    #  Siehe docs/30-T-Stehen-und-Gehen.md.
     walk_policy = os.environ.get('G1_WALK_POLICY', '').strip() or 'g1_wholebody'
     #  Arme beim Laufen parken, wenn die Policy ihre Lauf-Pose braucht (aus der
     #  deploy.yaml, siehe walk_policy.needs_arm_pose).
@@ -56,7 +58,7 @@ def generate_launch_description():
     #  G1_PS4_ARMS : "1"/"0" — PS4-Controller steuert den OBERKOERPER (Arme +
     #  Haende, kein Laufen): ps4_joystick + ps4_arm_teleop statt des alten
     #  joystick-Nodes. Der Container braucht dafuer /dev/input (start.sh nimmt
-    #  dann docker-compose.ps4.yml dazu). Siehe g1pilot/docs/43_ps4_controller.md.
+    #  dann docker-compose.ps4.yml dazu). Siehe g1pilot/docs/11-A-Controller.md.
     ps4_arms = os.environ.get('G1_PS4_ARMS', '0').strip().lower() in ('1', 'true', 'yes', 'on')
     #  G1_PS4_WALK : "1"/"0" — zusaetzlich Gehen per PS4 (L2 halten + Sticks,
     #  wirkt nur im WALK-Zustand von loco_sim). Default an.
@@ -125,7 +127,7 @@ def generate_launch_description():
         #    IMMER gestartet (nicht an G1_ENABLE_NAV gekoppelt!): der IK-Solver
         #    (arm_controller.py, Schritt 2) braucht die Umgebung genauso wie
         #    die Nav-Karte weiter unten -- Manipulation soll auch OHNE
-        #    aktivierte Navigation um Hindernisse wissen. Siehe g1pilot/docs/51_navigation_technik.md.
+        #    aktivierte Navigation um Hindernisse wissen. Siehe g1pilot/docs/31-T-Navigation.md.
         Node(
             package='g1pilot', executable='scene_bridge', name='scene_bridge',
             output='screen'
@@ -163,9 +165,9 @@ def generate_launch_description():
     ]
 
     # ── 5. Inspire-FTP-Hand-Bridge (nur bei Inspire-Haenden) ────────────
-    #    Bedient die HTML-GUIs (Controller :8766 / Viewer :8765), bewegt die Finger in
+    #    Bedient die Demo-GUI (/g1pilot/hand_cmd, /g1pilot/hand_status), bewegt die Finger in
     #    RViz (/joint_states) UND redet per DDS (rt/inspire/cmd|state) mit der MuJoCo-
-    #    Sim: backend='mujoco' -> echte Finger-Winkel + Touch-Kraefte in den GUIs.
+    #    Sim: backend='mujoco' -> echte Finger-Winkel + Touch-Kraefte in der GUI.
     if inspire_hands:
         nodes.append(Node(
             package='g1pilot',
@@ -173,9 +175,6 @@ def generate_launch_description():
             name='inspire_ftp_bridge',
             output='screen',
             parameters=[{
-                'ws_host':        '0.0.0.0',
-                'controller_port': 8766,
-                'viewer_port':     8765,
                 'update_rate_hz':  50.0,
                 'backend':         'mujoco',
                 'interface':       'lo',

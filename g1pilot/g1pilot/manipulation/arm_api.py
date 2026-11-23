@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 arm_api.py — HTTP-JSON-Bruecke fuer die Live-Pose-Schnittstelle.
-Vollstaendige Doku inkl. Beispielen: g1pilot/docs/21_arm_api_technik.md
+Vollstaendige Doku inkl. Beispielen: g1pilot/docs/21-T-Arm-API.md
 
 WOZU: Ein fremdes Projekt berechnet eine Armposition und will sie ausfuehren
 lassen. Ueber ROS geht das schon (`/g1pilot/arm_command`), aber der Aufrufer
@@ -90,7 +90,7 @@ class ArmApiNode(Node):
         self.pub_cancel = self.create_publisher(Bool, "/g1pilot/arm_command/cancel", 10)
         self.create_subscription(String, "/g1pilot/arm_command/status",
                                  self._on_status, 50)
-        # Speichern laeuft ueber das Topic, das auch die Streamdeck-GUI nutzt --
+        # Speichern laeuft ueber das Topic, das auch die Demo-GUI nutzt --
         # eine Implementierung, zwei Aufrufer (siehe arm_controller._on_pose_save).
         self.pub_save = self.create_publisher(String, "/g1pilot/pose_store/save", 10)
         self.create_subscription(String, "/g1pilot/pose_store/save/status",
@@ -346,7 +346,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _do_save(self):
         """POST /arm/save — AKTUELLE Stellung in die Pose-Datei schreiben.
 
-        Bewegt nichts. Geht auf dasselbe Topic wie der Streamdeck-Speichern-
+        Bewegt nichts. Geht auf dasselbe Topic wie der GUI-Speichern-
         Dialog, also dieselbe Implementierung und dieselbe Datei; der Rueckkanal
         sagt, WAS tatsaechlich gespeichert wurde (Haende brauchen eine laufende
         inspire-Bridge). Gespeichert wird immer sofort -- kein `wait` noetig, die
@@ -382,7 +382,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _describe(self) -> dict:
         return {
             "service": "g1pilot arm API",
-            "doc": "g1pilot/docs/21_arm_api_technik.md",
+            "doc": "g1pilot/docs/21-T-Arm-API.md",
             "endpoints": {
                 "POST /arm/joints": "Gelenkwinkel (7 je Arm, rad) direkt anfahren",
                 "POST /arm/pose": "Kartesische Hand-Pose anfahren (IK + Planung)",
@@ -419,7 +419,7 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     node.get_logger().info(
         f"Arm-API auf http://{host}:{port} (POST /arm/joints | /arm/pose, "
-        f"Doku: g1pilot/docs/21_arm_api_technik.md)"
+        f"Doku: g1pilot/docs/21-T-Arm-API.md)"
         + ("" if node.token else "  [ohne Token -- nur fuer lokalen Zugriff]"))
 
     try:

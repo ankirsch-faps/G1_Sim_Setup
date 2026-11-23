@@ -31,11 +31,11 @@ def generate_launch_description():
         # Selbstkollisions-Gate (kommandierte Pose wird vor dem Senden geprueft).
         DeclareLaunchArgument("self_collision_gate", default_value="true"),
         # Umgebungs-Kollisions-Gate (Hindernisse/Greif-Objekte aus /scene_markers,
-        # siehe g1pilot/docs/11_arm_manipulation_technik.md (Umgebungs-Kollisionsgate)). Eigener Schalter, unabhaengig vom
+        # siehe g1pilot/docs/20-T-Arm-Manipulation.md (Umgebungs-Kollisionsgate)). Eigener Schalter, unabhaengig vom
         # Selbstkollisions-Gate oben.
         DeclareLaunchArgument("environment_collision_gate", default_value="true"),
         # Toleranz [rad] fuer die geplante Bewegung (Positionsspeicher, siehe
-        # g1pilot/docs/11_arm_manipulation_technik.md (Positionsspeicher)), ab der ein Wegpunkt als erreicht gilt.
+        # g1pilot/docs/20-T-Arm-Manipulation.md (Positionsspeicher)), ab der ein Wegpunkt als erreicht gilt.
         DeclareLaunchArgument("planned_motion_tolerance", default_value="0.02"),
         # Glaettung geplanter Pose-Fahrten (-1 = wie ik_alpha), Wartezeit reiner
         # Hand-Posen. Sim setzt schnellere Werte (bringup_sim).
@@ -62,6 +62,8 @@ def generate_launch_description():
         DeclareLaunchArgument("kd_waist", default_value="4.0"),
         # E-Stop: Taille gehalten lassen (nur Arme/Haende schlaff). false = alt.
         DeclareLaunchArgument("estop_waist_hold", default_value="true"),
+        # Taillen-Ziel beim ENABLE: hold | zero | onboard (siehe waist_hold.py).
+        DeclareLaunchArgument("waist_mode", default_value="hold"),
         # Hueftdrehung per Controller/GUI (waist_yaw.py): Bereich um die Mitte.
         # Real per bringup_real ueber G1_WAIST_YAW_LIMIT_DEG (Default 105).
         DeclareLaunchArgument("waist_yaw_control", default_value="true"),
@@ -80,13 +82,13 @@ def generate_launch_description():
         # Menue "Enable publishing" aktiviert. Der Arm bewegt sich ohnehin nur,
         # wenn /g1pilot/arms/enabled true ist -> das bleibt die Sicherheitsschranke.
         DeclareLaunchArgument("marker_publish_default", default_value="true"),
-        # Leader-Follower: Marker folgt der Hand im Idle (per Streamdeck/Topic schaltbar).
+        # Leader-Follower: Marker folgt der Hand im Idle (per Topic schaltbar).
         DeclareLaunchArgument("marker_follow_ee", default_value="true"),
         # Arme beim Laufen in die Lauf-Pose parken (true, real immer) oder frei
         # lassen (false: Sim mit der AGILE-Lauf-Policy, setzt bringup_sim). Steuert
         # arm_controller walk_park_arms und interactive_marker hide_in_walk.
         DeclareLaunchArgument("walk_park_arms", default_value="true"),
-        # Live-Pose-Schnittstelle (siehe g1pilot/docs/21_arm_api_technik.md): HTTP-JSON-Bruecke, damit
+        # Live-Pose-Schnittstelle (siehe g1pilot/docs/21-T-Arm-API.md): HTTP-JSON-Bruecke, damit
         # fremde Projekte OHNE ROS Zielposen einspielen koennen. Bind bewusst auf
         # 127.0.0.1 -- der Container laeuft mit network_mode: host, ein Prozess
         # auf dem Host erreicht die API also ueber localhost, das Netz nicht.
@@ -137,6 +139,7 @@ def generate_launch_description():
                 'kp_waist': ParameterValue(LaunchConfiguration("kp_waist"), value_type=float),
                 'kd_waist': ParameterValue(LaunchConfiguration("kd_waist"), value_type=float),
                 'estop_waist_hold': ParameterValue(LaunchConfiguration("estop_waist_hold"), value_type=bool),
+                'waist_mode': ParameterValue(LaunchConfiguration("waist_mode"), value_type=str),
                 'waist_yaw_control': ParameterValue(
                     LaunchConfiguration("waist_yaw_control"), value_type=bool),
                 'waist_yaw_limit_deg': ParameterValue(

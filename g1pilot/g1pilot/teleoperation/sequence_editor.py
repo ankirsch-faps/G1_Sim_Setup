@@ -11,10 +11,13 @@ Reihenfolge stellt man hier ein -- kein Umbenennen, keine Kopien.
   Mitte   Schritte des gewaehlten Ablaufs: verschieben (auch ziehen),
           entfernen, Pause danach (nur »am Stueck«), »Aktuelle Stellung als
           Schritt …« (speichern + anhaengen in einem Zug)
-  rechts  gespeicherte Posen nach Kategorie: »← Hinzufügen« (Doppelklick),
+  rechts  gespeicherte Posen nach Kategorie: »Hinzufügen« (Doppelklick),
           anfahren, loeschen, aktuelle Stellung speichern; darueber die
           RELATIVEN BEWEGUNGEN (z. B. »Box anheben« = Haende 5 cm hoch, egal
           wo sie gerade sind): neu, bearbeiten, loeschen, hinzufuegen
+
+Zweiter Reiter »Controller-Schnellwahl« (quickslot_panel.py): Posen auf die
+16 Plaetze R2 halten + Steuerkreuz zweimal legen.
 
 Jede Aenderung wird sofort gespeichert. Das Fenster ist nicht modal: man
 kann nebenher die Hand bewegen (Jog, Controller) und dann die Stellung als
@@ -22,18 +25,24 @@ Schritt uebernehmen. Bewegt wird nur ueber die Methoden der Demo-GUI
 (run_sequence/run_poses -> geplantes POSE ANFAHREN im arm_controller).
 """
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QIcon
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel, QListWidget,
-    QListWidgetItem, QPushButton, QTreeWidget, QTreeWidgetItem, QInputDialog,
-    QMessageBox, QDoubleSpinBox, QAbstractItemView, QGroupBox, QFormLayout,
-    QLineEdit, QCheckBox, QDialogButtonBox,
+    QListWidgetItem, QPushButton, QTreeWidget, QTreeWidgetItem,
+    QDoubleSpinBox, QAbstractItemView,
+    QLineEdit, QCheckBox, QTabWidget, QWidget,
 )
 
 from g1pilot.manipulation.pose_store import MAX_MOVE_M, clean_move
+from g1pilot.utils import msgbox, ui_icons
+from g1pilot.teleoperation.quickslot_panel import QuickSlotPanel
+from g1pilot.teleoperation import dialog_style as ds
 from g1pilot.teleoperation.sequence_runner import pretty_pose_name, step_name
 
-MOVES_GROUP = "↕ Relative Bewegungen"
+MOVES_GROUP = "Relative Bewegungen"
+MOVE_ICON = "move"               # Kennzeichen relativer Bewegungen (Baum + Schritte)
+SEQ_COLOR = "#66bb6a"            # wie »Abläufe« in der Controller-Belegung
+POSE_COLOR = "#ff9800"           # wie GREIFEN
 
 ROLE = Qt.ItemDataRole.UserRole
 
@@ -46,50 +55,74 @@ class SequenceEditor(QDialog):
         super().__init__(parent)
         self.gui = gui
         self.setWindowTitle("Posen & Abläufe")
-        self.resize(1080, 620)
-        # Gross genug fuer den Touchscreen am Roboter-Rechner.
-        self.setStyleSheet("QWidget { font-size:15px; } QListWidget::item, QTreeWidget::item "
-                           "{ padding:5px 2px; } QPushButton { min-height:34px; }")
+        self.resize(1180, 720)
+        # Look wie die anderen Neben-Fenster (Controller-Belegung, Handy):
+        # dunkle Karten mit Icon-Kopf (dialog_style.py). Gross genug fuer den
+        # Touchscreen am Roboter-Rechner.
+        self.setStyleSheet(ds.DIALOG_CSS + "QPushButton { min-height:22px; }")
         self._loading = False
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(12)
+        root.addLayout(ds.header(
+            "Posen & Abläufe", "layout-grid", ds.ACCENT,
+            "Posen speichern und anfahren, zu Abläufen zusammenstellen und auf die "
+            "Controller-Schnellwahl legen. Jede Änderung wird sofort gespeichert."))
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+        page = QWidget()
+        page.setObjectName("dbody")
+        page_lay = QVBoxLayout(page)
+        page_lay.setContentsMargins(0, 12, 0, 0)
+        page_lay.setSpacing(10)
         cols = QHBoxLayout()
-        root.addLayout(cols, 1)
+        cols.setSpacing(12)
+        page_lay.addLayout(cols, 1)
+        self.tabs.addTab(page, ui_icons.icon("play", ds.FG, 16), "Abläufe und Posen")
+        # Reiter 2: Posen auf die 16 Controller-Plaetze legen (R2 + Steuerkreuz 2x).
+        self.quick = QuickSlotPanel(gui)
+        self.tabs.addTab(self.quick, ui_icons.icon("gamepad-2", ds.FG, 16),
+                         "Controller-Schnellwahl")
 
         # ── Ablaeufe ────────────────────────────────────────────────────
-        box_seq = QGroupBox("Abläufe")
-        ls = QVBoxLayout(box_seq)
+        box_seq, ls = ds.card("Abläufe", "play", SEQ_COLOR, "Folge von Posen und Bewegungen")
         self.seq_list = QListWidget()
         ls.addWidget(self.seq_list, 1)
         g = QGridLayout()
-        self.btn_new = QPushButton("Neu …")
-        self.btn_rename = QPushButton("Umbenennen …")
-        self.btn_copy = QPushButton("Kopieren …")
-        self.btn_del_seq = QPushButton("Löschen")
+        g.setSpacing(8)
+        self.btn_new = ds.button("Neu …", "plus")
+        self.btn_rename = ds.button("Umbenennen …", "square-pen")
+        self.btn_copy = ds.button("Kopieren …", "folder-open")
+        self.btn_del_seq = ds.button("Löschen", "trash-2", color=ds.BAD)
         for i, b in enumerate((self.btn_new, self.btn_rename, self.btn_copy, self.btn_del_seq)):
             g.addWidget(b, i // 2, i % 2)
         ls.addLayout(g)
-        self.btn_run = QPushButton("▶ Ablauf starten")
+        self.btn_run = ds.button("Ablauf starten", "play", "primary", "#ffffff")
         self.btn_run.setMinimumHeight(40)
         ls.addWidget(self.btn_run)
         cols.addWidget(box_seq, 3)
 
         # ── Schritte ────────────────────────────────────────────────────
-        self.box_steps = QGroupBox("Schritte")
-        lm = QVBoxLayout(self.box_steps)
+        self.box_steps, lm = ds.card("Schritte", "arrow-up-down", ds.ACCENT,
+                                     "Reihenfolge per Ziehen oder Pfeilen")
+        self.steps_title = self.box_steps.findChildren(QLabel)[1]
         self.step_list = QListWidget()
         self.step_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.step_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         lm.addWidget(self.step_list, 1)
         row = QHBoxLayout()
-        self.btn_up = QPushButton("▲")
-        self.btn_down = QPushButton("▼")
-        self.btn_remove = QPushButton("Entfernen")
+        row.setSpacing(8)
+        self.btn_up = ds.button("", "chevron-up", size=18)
+        self.btn_down = ds.button("", "chevron-down", size=18)
+        self.btn_up.setToolTip("Schritt nach oben")
+        self.btn_down.setToolTip("Schritt nach unten")
+        self.btn_remove = ds.button("Entfernen", "x")
         for b in (self.btn_up, self.btn_down, self.btn_remove):
             row.addWidget(b)
         lm.addLayout(row)
         prow = QHBoxLayout()
-        prow.addWidget(QLabel("Pause nach dem Schritt (nur »Am Stück«):"))
+        prow.addWidget(QLabel("Pause danach (nur »Am Stück«):"))
         self.spin_wait = QDoubleSpinBox()
         self.spin_wait.setRange(0.0, 600.0)
         self.spin_wait.setDecimals(1)
@@ -97,42 +130,49 @@ class SequenceEditor(QDialog):
         self.spin_wait.setSuffix(" s")
         prow.addWidget(self.spin_wait)
         lm.addLayout(prow)
-        self.btn_teach = QPushButton("＋ Aktuelle Stellung als Schritt …")
+        self.btn_teach = ds.button("Aktuelle Stellung als Schritt …", "plus")
         self.btn_teach.setMinimumHeight(40)
         lm.addWidget(self.btn_teach)
         cols.addWidget(self.box_steps, 4)
 
         # ── Posen ───────────────────────────────────────────────────────
-        box_pose = QGroupBox("Posen & relative Bewegungen")
-        lp = QVBoxLayout(box_pose)
+        box_pose, lp = ds.card("Posen & relative Bewegungen", "hand", POSE_COLOR,
+                               "Doppelklick hängt an den Ablauf an")
+        self.pose_search = QLineEdit()
+        self.pose_search.setPlaceholderText("Pose suchen …")
+        self.pose_search.setClearButtonEnabled(True)
+        self.pose_search.addAction(ui_icons.icon("search", ds.MUTED, 16),
+                                   QLineEdit.ActionPosition.LeadingPosition)
+        lp.addWidget(self.pose_search)
         self.pose_tree = QTreeWidget()
         self.pose_tree.setHeaderHidden(True)
         lp.addWidget(self.pose_tree, 1)
-        self.btn_add = QPushButton("← Hinzufügen")
+        self.btn_add = ds.button("Hinzufügen", "arrow-left", "primary", "#ffffff")
         self.btn_add.setMinimumHeight(40)
         lp.addWidget(self.btn_add)
         prow2 = QHBoxLayout()
-        self.btn_goto = QPushButton("Anfahren")
-        self.btn_del_pose = QPushButton("Löschen")
+        prow2.setSpacing(8)
+        self.btn_goto = ds.button("Anfahren", "play")
+        self.btn_del_pose = ds.button("Löschen", "trash-2", color=ds.BAD)
         prow2.addWidget(self.btn_goto)
         prow2.addWidget(self.btn_del_pose)
         lp.addLayout(prow2)
-        self.btn_save_pose = QPushButton("Aktuelle Stellung speichern …")
+        self.btn_save_pose = ds.button("Aktuelle Stellung speichern …", "save")
         lp.addWidget(self.btn_save_pose)
         prow3 = QHBoxLayout()
-        self.btn_new_move = QPushButton("Neue relative Bewegung …")
-        self.btn_edit_move = QPushButton("Bearbeiten …")
+        prow3.setSpacing(8)
+        self.btn_new_move = ds.button("Neue relative Bewegung …", MOVE_ICON)
+        self.btn_edit_move = ds.button("Bearbeiten …", "square-pen")
         prow3.addWidget(self.btn_new_move, 2)
         prow3.addWidget(self.btn_edit_move, 1)
         lp.addLayout(prow3)
         cols.addWidget(box_pose, 4)
 
-        self.hint = QLabel("Doppelklick auf eine Pose hängt sie an. Reihenfolge per Ziehen "
-                           "oder ▲/▼. Änderungen werden sofort gespeichert.")
-        self.hint.setWordWrap(True)
-        self.hint.setStyleSheet("color:#999;")
-        root.addWidget(self.hint)
+        self.hint = ds.hint("Doppelklick auf eine Pose hängt sie an. Reihenfolge per Ziehen "
+                            "oder mit den Pfeil-Knöpfen. Änderungen werden sofort gespeichert.")
+        page_lay.addWidget(self.hint)
 
+        self.pose_search.textChanged.connect(self._filter_poses)
         self.seq_list.currentItemChanged.connect(lambda *_: self._load_steps())
         self.btn_new.clicked.connect(self._new)
         self.btn_rename.clicked.connect(self._rename)
@@ -196,6 +236,7 @@ class SequenceEditor(QDialog):
         keep_item = self._selected_item()
         self.pose_tree.clear()
         top = QTreeWidgetItem([MOVES_GROUP])
+        top.setIcon(0, ui_icons.icon(MOVE_ICON, ds.ACCENT, 16))
         top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         top.setToolTip(0, "Verschieben die Hände relativ zur aktuellen Stellung.")
         for n, mv in moves.items():
@@ -211,6 +252,7 @@ class SequenceEditor(QDialog):
         self.pose_tree.addTopLevelItem(top)
         for cat, names in grouped.items():
             top = QTreeWidgetItem([cat])
+            top.setIcon(0, ui_icons.icon("folder-open", POSE_COLOR, 16))
             top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             for n in names:
                 comps = store.components(n) or []
@@ -222,8 +264,25 @@ class SequenceEditor(QDialog):
                     self.pose_tree.setCurrentItem(child)
             self.pose_tree.addTopLevelItem(top)
         self.pose_tree.expandAll()
+        self._filter_poses(self.pose_search.text())
         self._loading = False
         self._load_steps()
+        self.quick.reload()
+
+    def _filter_poses(self, text):
+        """Suchfeld: nur passende Posen/Bewegungen zeigen (viele Posen)."""
+        needle = (text or "").strip().lower()
+        for i in range(self.pose_tree.topLevelItemCount()):
+            top = self.pose_tree.topLevelItem(i)
+            shown = 0
+            for j in range(top.childCount()):
+                child = top.child(j)
+                hit = not needle or needle in child.text(0).lower() \
+                    or needle in top.text(0).lower()
+                selectable = child.data(0, ROLE) is not None
+                child.setHidden(bool(needle) and not (hit and selectable))
+                shown += not child.isHidden()
+            top.setHidden(bool(needle) and shown == 0)
 
     def _load_steps(self):
         if self._loading:
@@ -240,7 +299,7 @@ class SequenceEditor(QDialog):
         if self.step_list.count():
             self.step_list.setCurrentRow(min(max(row, 0), self.step_list.count() - 1))
         self._loading = False
-        self.box_steps.setTitle(f"Schritte von »{name}«" if name else "Schritte")
+        self.steps_title.setText(f"Schritte von »{name}«" if name else "Schritte")
         self._sync()
 
     def _step_item(self, step):
@@ -255,11 +314,13 @@ class SequenceEditor(QDialog):
             if "move" in st:
                 mv = self._moves.get(st["move"])
                 missing = mv is None
-                text = f"{i + 1}. ↕ {st['move']}"
+                text = f"{i + 1}. {st['move']}"
+                it.setIcon(ui_icons.icon(MOVE_ICON, ds.ACCENT, 16))
                 if mv is not None:
                     text += f"   ({move_text(mv)})"
             else:
                 missing = st["pose"] not in self._known
+                it.setIcon(QIcon())
                 text = f"{i + 1}. {pretty_pose_name(st['pose'])}"
                 if pretty_pose_name(st["pose"]) != st["pose"].replace("_", " "):
                     text += f"   ({st['pose']})"
@@ -268,7 +329,7 @@ class SequenceEditor(QDialog):
             if missing:
                 text += "   — FEHLT"
             it.setText(text)
-            it.setForeground(QColor("#ef5350") if missing else QColor("#dddddd"))
+            it.setForeground(QColor(ds.BAD) if missing else QColor(ds.FG))
 
     def _steps(self):
         return [self.step_list.item(i).data(ROLE) for i in range(self.step_list.count())]
@@ -284,7 +345,7 @@ class SequenceEditor(QDialog):
         try:
             store.save_sequence(name, self._steps())
         except (OSError, ValueError) as e:
-            QMessageBox.warning(self, "Ablauf", f"Nicht gespeichert: {e}")
+            msgbox.warn(self, "Ablauf", f"Nicht gespeichert: {e}")
             return
         self._renumber()
         it = self.seq_list.currentItem()
@@ -319,7 +380,7 @@ class SequenceEditor(QDialog):
 
     # ── Ablaeufe ────────────────────────────────────────────────────────
     def _ask_name(self, title, text, default=""):
-        name, ok = QInputDialog.getText(self, title, text, text=default)
+        name, ok = msgbox.ask_text(self, title, text, text=default)
         name = (name or "").strip()
         return name if ok and name else None
 
@@ -348,21 +409,21 @@ class SequenceEditor(QDialog):
         name = self.current_sequence()
         if not name:
             return
-        if QMessageBox.question(self, "Ablauf löschen",
-                                f"Ablauf »{name}« löschen? Die Posen selbst bleiben erhalten."
-                                ) != QMessageBox.StandardButton.Yes:
+        if not msgbox.confirm(self, "Ablauf löschen",
+                              f"Ablauf »{name}« löschen? Die Posen selbst bleiben erhalten.",
+                              yes="Löschen", danger=True):
             return
         self._try(lambda s: s.delete_sequence(name), select="")
 
     def _try(self, fn, select=None):
         store = self._store()
         if store is None:
-            QMessageBox.warning(self, "Abläufe", "Posen-Datei nicht lesbar.")
+            msgbox.warn(self, "Abläufe", "Posen-Datei nicht lesbar.")
             return
         try:
             fn(store)
         except (OSError, ValueError) as e:
-            QMessageBox.warning(self, "Abläufe", str(e))
+            msgbox.warn(self, "Abläufe", str(e))
             return
         self.reload(select=select)
         self._changed()
@@ -445,8 +506,8 @@ class SequenceEditor(QDialog):
                 if any(s.get(kind) == name for s in steps)]
         extra = (f"\n\nSie wird in {len(used)} Ablauf/Abläufen benutzt ({', '.join(used)}); "
                  "dort erscheint sie dann als FEHLT." if used else "")
-        if QMessageBox.question(self, f"{what} löschen", f"{what} »{name}« löschen?{extra}"
-                                ) != QMessageBox.StandardButton.Yes:
+        if not msgbox.confirm(self, f"{what} löschen", f"{what} »{name}« löschen?{extra}",
+                              yes="Löschen", danger=True):
             return
         self._try(lambda s: s.delete_move(name) if kind == "move" else s.delete(name))
 
@@ -489,15 +550,30 @@ class MoveDialog(QDialog):
     def __init__(self, parent, name="", move=None):
         super().__init__(parent)
         self.setWindowTitle("Relative Bewegung")
+        self.setStyleSheet(ds.DIALOG_CSS)
+        self.setMinimumWidth(520)
         move = move or {"dx": 0.0, "dy": 0.0, "dz": 0.05, "sides": ["left", "right"]}
         lay = QVBoxLayout(self)
-        form = QFormLayout()
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+        lay.addLayout(ds.header("Relative Bewegung", MOVE_ICON, ds.ACCENT,
+                                "Hände um ein paar Zentimeter verschieben, egal wo sie gerade "
+                                "sind (z. B. »Box anheben« = 5 cm hoch)."))
+        card, cl = ds.card("Name", "square-pen")
         self.ed_name = QLineEdit(name)
         self.ed_name.setPlaceholderText("z. B. Box anheben")
-        form.addRow("Name:", self.ed_name)
+        cl.addWidget(self.ed_name)
+        lay.addWidget(card)
+        card, cl = ds.card("Verschiebung", "move", ds.ACCENT,
+                           "Oberkörper-Bezug, bei gedrehter Hüfte mitgedreht")
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
         self.spins = {}
-        for key, label in (("dx", "vor (+) / zurück (−)"), ("dy", "links (+) / rechts (−)"),
-                           ("dz", "hoch (+) / runter (−)")):
+        for r, (key, icon, label) in enumerate((
+                ("dx", "arrow-up", "vor (+) / zurück (−)"),
+                ("dy", "arrow-left", "links (+) / rechts (−)"),
+                ("dz", "chevron-up", "hoch (+) / runter (−)"))):
             sp = QDoubleSpinBox()
             lim = MAX_MOVE_M * 100
             sp.setRange(-lim, lim)
@@ -505,8 +581,17 @@ class MoveDialog(QDialog):
             sp.setSingleStep(1.0)
             sp.setSuffix(" cm")
             sp.setValue(float(move.get(key, 0.0)) * 100)
-            form.addRow(label + ":", sp)
+            sp.setMinimumWidth(130)
+            form.setRowMinimumHeight(r, 40)
+            vc = Qt.AlignmentFlag.AlignVCenter
+            form.addWidget(ds.icon_box(icon, ds.ACCENT, 16, 30), r, 0, vc)
+            form.addWidget(QLabel(label), r, 1, vc)
+            form.addWidget(sp, r, 2, vc)
             self.spins[key] = sp
+        form.setColumnStretch(1, 1)
+        cl.addLayout(form)
+        lay.addWidget(card)
+        card, cl = ds.card("Welche Hände?", "hand", POSE_COLOR)
         row = QHBoxLayout()
         self.cb_left = QCheckBox("Linke Hand")
         self.cb_right = QCheckBox("Rechte Hand")
@@ -514,21 +599,13 @@ class MoveDialog(QDialog):
         self.cb_right.setChecked("right" in move["sides"])
         row.addWidget(self.cb_left)
         row.addWidget(self.cb_right)
-        form.addRow("Hände:", row)
-        lay.addLayout(form)
-        hint = QLabel("Bezug: Oberkörper des Roboters (bei gedrehter Hüfte mitgedreht). "
-                      "Ziel = aktuelle Hand + Verschiebung, Orientierung bleibt; "
-                      "die Bahn wird wie bei jeder Pose geplant.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#999;")
-        lay.addWidget(hint)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
-                                | QDialogButtonBox.StandardButton.Cancel)
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Speichern")
-        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("Abbrechen")
-        btns.accepted.connect(self._accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
+        row.addStretch(1)
+        cl.addLayout(row)
+        lay.addWidget(card)
+        lay.addWidget(ds.hint("Ziel = aktuelle Hand + Verschiebung, Orientierung bleibt; "
+                              f"je Achse höchstens ±{MAX_MOVE_M * 100:.0f} cm. Die Bahn wird "
+                              "wie bei jeder Pose geplant (Kollisionsschutz)."))
+        lay.addLayout(_dialog_buttons(self, "Speichern", "save", self._accept))
 
     def result(self):
         sides = [s for s, cb in (("left", self.cb_left), ("right", self.cb_right))
@@ -544,9 +621,24 @@ class MoveDialog(QDialog):
                 raise ValueError("Bitte einen Namen eingeben.")
             clean_move(**mv)
         except ValueError as e:
-            QMessageBox.warning(self, "Relative Bewegung", str(e))
+            msgbox.warn(self, "Relative Bewegung", str(e))
             return
         self.accept()
+
+
+def _dialog_buttons(dlg, ok_text, ok_icon, on_ok):
+    """Abbrechen (links daneben) + Hauptknopf rechts, wie die Karten-Dialoge."""
+    row = QHBoxLayout()
+    row.addStretch(1)
+    cancel = ds.button("Abbrechen", k="ghost")
+    cancel.clicked.connect(dlg.reject)
+    ok = ds.button(ok_text, ok_icon, "primary", "#ffffff")
+    ok.setDefault(True)
+    ok.clicked.connect(on_ok)
+    row.addWidget(cancel)
+    row.addWidget(ok)
+    dlg.btn_ok, dlg.btn_cancel = ok, cancel
+    return row
 
 
 def _comp_short(comps):

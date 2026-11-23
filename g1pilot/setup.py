@@ -13,7 +13,7 @@ def expand(patterns):
 setup(
     name=package_name,
     version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    packages=find_packages(exclude=['test', 'start_gui', 'start_gui.*']),  # start_gui = Host-Startmenue
     data_files=[
         ('share/ament_index/resource_index/packages', [f'resource/{package_name}']),
         (f'share/{package_name}', ['package.xml']),
@@ -23,19 +23,14 @@ setup(
             'launch/robot_state_launcher.launch.py',
             'launch/teleoperation_launcher.launch.py',
             'launch/navigation_launcher.launch.py',
-            'launch/mola_launcher.launch.py',
-            'launch/livox_launcher.launch.py',
             'launch/manipulation_launcher.launch.py',
             'launch/hand_launcher.launch.py',
 
-            'launch/bringup_launcher.launch.py',
             'launch/bringup_sim.launch.py',
             'launch/bringup_real.launch.py',
         ]),
 
         # Inspire-FTP-Hand HTML-GUIs (Controller/Viewer) – im Browser zu oeffnen.
-        (f'share/{package_name}/manipulation/inspire_ftp/web',
-            expand(['g1pilot/manipulation/inspire_ftp/web/*.html'])),
         (f'share/{package_name}/teleoperation/phone/web',
             expand(['g1pilot/teleoperation/phone/web/*'])),
 
@@ -58,10 +53,9 @@ setup(
         # Fenster-Icons (Dock/Taskleiste), siehe g1pilot/utils/window_style.py
         (f'share/{package_name}/resource/icons',
             expand(['resource/icons/*.png', 'resource/icons/*.svg'])),
-
-        # MOLA LiDAR-odometry pipeline (used by mola_launcher.launch.py)
-        (f'share/{package_name}/pipelines',
-            expand(['pipelines/*.yaml'])),
+        # Bedien-Icons (Lucide, ISC) statt Emojis, siehe g1pilot/utils/ui_icons.py
+        (f'share/{package_name}/resource/icons/ui',
+            expand(['resource/icons/ui/*.svg', 'resource/icons/ui/LICENSE'])),
 
         # Lauf-Policy fuer loco_sim (Default): NVIDIA WBC-AGILE Velocity-G1-History.
         (f'share/{package_name}/policies/agile_velocity_g1',
@@ -93,20 +87,19 @@ setup(
             # Manipulation Nodes
             'interactive_marker = g1pilot.manipulation.interactive_marker:main',
             'arm_controller = g1pilot.manipulation.arm_controller:main',
-            # Inspire-FTP-Hand: GUI-WebSocket-Bridge + DDS-Backend (rt/inspire/cmd|state).
+            # Inspire-FTP-Hand: ROS-Bridge + DDS-/Modbus-Backend (rt/inspire/cmd|state).
             'inspire_hand = g1pilot.manipulation.inspire_ftp.bridge:main',
-            # Live-Pose-Schnittstelle: HTTP-JSON -> /g1pilot/arm_command (g1pilot/docs/21_arm_api_technik.md).
+            # Live-Pose-Schnittstelle: HTTP-JSON -> /g1pilot/arm_command (g1pilot/docs/21-T-Arm-API.md).
             'arm_api = g1pilot.manipulation.arm_api:main',
 
             # Teleoperation Nodes
             'joystick = g1pilot.teleoperation.joystick:main',
             'joy_mux = g1pilot.teleoperation.joy_mux:main',
-            'ui_interface = g1pilot.teleoperation.ui_interface:main',
-            # Vereinfachte Demo-Oberflaeche (Konzept), Auswahl via G1_GUI=demo.
+            # Bedienoberflaeche (einzige GUI, die Streamdeck-GUI ist entfernt).
             'demo_gui = g1pilot.teleoperation.demo_gui:main',
             # PS4-Controller fuer den Oberkoerper (nur Arme/Haende, kein Laufen):
             # evdev -> /g1pilot/ps4/joy (feste Belegung) -> Hand-Ziele/Hand-Aktionen.
-            # Siehe g1pilot/docs/43_ps4_controller.md, Start via G1_PS4_ARMS=1.
+            # Siehe g1pilot/docs/11-A-Controller.md, Start via G1_PS4_ARMS=1.
             'ps4_joystick = g1pilot.teleoperation.ps4_joystick:main',
             'ps4_arm_teleop = g1pilot.teleoperation.ps4_arm_teleop:main',
             'ps4_walk = g1pilot.teleoperation.ps4_walk:main',
@@ -118,18 +111,17 @@ setup(
             'nav2point = g1pilot.navigation.nav2point:main',
             'create_map = g1pilot.navigation.create_map:main',
             # Umgebungs-Objekte (Hindernisse + Greif-Objekte) aus der MuJoCo-Sim
-            # -> /scene_markers (RViz + Nav + IK-Kollision). Siehe g1pilot/docs/51_navigation_technik.md.
+            # -> /scene_markers (RViz + Nav + IK-Kollision). Siehe g1pilot/docs/31-T-Navigation.md.
             'scene_bridge = g1pilot.navigation.scene_bridge:main',
-            'mola_fixed = g1pilot.navigation.fix_mola_odometry:main',
-            # Sim-Nav-Glue (nur Sim): Ersatz fuer MOLA (Pose aus rt/sportmodestate)
-            # und Joy->cmd_vel-Bruecke, damit der Real-Nav-Stack in MuJoCo laeuft.
+            # Sim-Nav-Glue (nur Sim): Pose aus rt/sportmodestate
+            # und Joy->cmd_vel-Bruecke fuer den Nav-Stack in MuJoCo.
             'sim_localization = g1pilot.navigation.sim_localization:main',
             'joy_to_cmdvel = g1pilot.navigation.joy_to_cmdvel:main',
 
             # Diagnostics / sim tools
             'sim_dds_check = g1pilot.tools.sim_dds_check:main',
             # Alias: dasselbe Tool ist mode-agnostisch (resolve_dds) und dient
-            # auf real als erster Verbindungstest zum G1 (s. g1pilot/docs/70_echtroboter_anleitung.md):
+            # auf real als erster Verbindungstest zum G1 (s. g1pilot/docs/50-A-Echter-Roboter.md):
             #   G1_SIM_MODE=false ros2 run g1pilot dds_check --interface <NIC>
             'dds_check = g1pilot.tools.sim_dds_check:main',
             'sim_arm_wiggle = g1pilot.tools.sim_arm_wiggle:main',

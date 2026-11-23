@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-arm_command.py — Wire-Format der Live-Pose-Schnittstelle (siehe g1pilot/docs/21_arm_api_technik.md).
+arm_command.py — Wire-Format der Live-Pose-Schnittstelle (siehe g1pilot/docs/21-T-Arm-API.md).
 
 BEWUSST OHNE ROS-/Pinocchio-Import: hier steckt nur das Parsen und Validieren
 der eingespielten Kommandos. Dadurch ist das Format (a) an EINER Stelle
@@ -47,7 +47,7 @@ COMMAND_TYPES = (TYPE_JOINTS, TYPE_POSE, TYPE_MIRROR)
 # Gelenkwinkeln: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
 # wrist_roll, wrist_pitch, wrist_yaw. Pitch-Gelenke (Achse y, senkrecht zur
 # Ebene) behalten den Winkel, Roll/Yaw-Gelenke (Achse x bzw. z, in der Ebene)
-# wechseln das Vorzeichen. Am URDF (g1_29dof_inspire_ftp.urdf und 29dof.urdf)
+# wechseln das Vorzeichen. Am URDF (g1_29dof_inspire_ftp.urdf)
 # per Vorwaertskinematik belegt (test_arm_mirror.py): die Hand der Spiegel-
 # Gelenkwinkel liegt GENAU auf der gespiegelten Hand-Pose -- Position
 # (x, -y, z), Orientierung S*R*S mit S = diag(1, -1, 1) -- Rest <= 0.01 mm
@@ -57,7 +57,7 @@ COMMAND_TYPES = (TYPE_JOINTS, TYPE_POSE, TYPE_MIRROR)
 # eine gueltige Pose bleibt gespiegelt gueltig.
 MIRROR_SIGNS = (1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0)
 
-# Status-Zustaende auf /g1pilot/arm_command/status (g1pilot/docs/21_arm_api_technik.md dokumentiert sie).
+# Status-Zustaende auf /g1pilot/arm_command/status (g1pilot/docs/21-T-Arm-API.md dokumentiert sie).
 ST_ACCEPTED = "accepted"     # angenommen, Planung laeuft
 ST_REJECTED = "rejected"     # abgelehnt (Format, Limits, Arme nicht bereit) -- Endzustand
 ST_EXECUTING = "executing"   # Bahn wird abgefahren
